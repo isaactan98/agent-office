@@ -63,6 +63,6 @@ tasks/        default TASKS_DIR — runtime output, gitignored
 
 ## Commands
 Fill these in as they are created:
-- Backend dev: `TBD`
-- Backend tests: `TBD`
-- Frontend dev: `TBD`
+- Backend dev: `cd backend && uv run uvicorn app.main:app --host 127.0.0.1 --port 8000`
+- Backend tests: `cd backend && uv run pytest`
+- Frontend dev: `cd frontend && npm run dev`

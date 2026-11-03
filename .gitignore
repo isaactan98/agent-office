@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Node / Nuxt
+node_modules/
+.nuxt/
+.output/
+.data/
+.nitro/
+.cache/
+dist/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime task output
+tasks/
+
+# macOS
+.DS_Store
