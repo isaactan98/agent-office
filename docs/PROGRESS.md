@@ -3,11 +3,53 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 2 done
+- Phase: 3 done
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `uv run pytest` → 63 passed; `npm run build` → build complete.
+- Blockers: none. `uv run pytest` → 98 passed; `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-03 — SG — M3 MacBook Air (session 4)
+- Done: Phase 3 events. `app/events.py`: `Event` pydantic model with the
+  PLAN.md fields in order (`extra="forbid"`, `type` Literal of the 10 types,
+  `ts` must have an offset, `path` must be relative, `task_id` matches the id
+  regex); `EventEmitter` (seq from 1, no gaps, Asia/Singapore `ts`, appends
+  to `events.jsonl`, publishes to `subscribe(task_id)` queues); summaries
+  collapsed to one line, ≤120 chars; `read_events`, `validate_file`
+  (`uv run python -m app.events <file>`). `app/runner.py`: `task_started`,
+  `task_done`/`task_failed`, `agent_message` per assistant `TextBlock`,
+  `tool_start`/`tool_denied` from the PreToolUse guard, `tool_end` from
+  PostToolUse and PostToolUseFailure (summary "… failed: path"; not asked
+  for in the prompt, added so failed tools don't leave an open
+  `tool_start`). Hooks never raise: a guard error now logs and returns an
+  explicit deny; event write errors are logged and the decision still
+  goes through. `GET /tasks/{task_id}/events` → JSON array (400/404 like
+  `GET /tasks/{id}`). Tests: `test_events.py`, hook/run_task event tests in
+  `test_runner.py` (synthetic hook inputs, fake `query`), endpoint tests in
+  `test_api.py`. Committed as 1ad9265 (not pushed).
+- Verified by: installed `types.py` — `agent_id`/`agent_type` are optional on
+  PreToolUse/PostToolUse/PostToolUseFailure/PermissionRequest (set only
+  inside a subagent) and required on SubagentStart/SubagentStop;
+  `agent = agent_type or "orchestrator"`. `uv run pytest` → 98 passed.
+  1 real run (of 1 allowed), backend started with `env -i`, `lsof` → listen
+  on 127.0.0.1:8000 only: task
+  `20261103-222005-write-output-hello-md-with-a-t` → `done` in ~12 s, 3
+  turns; `events.jsonl` 8 events (task_started, tool_start/tool_end Write,
+  agent_message, tool_start/tool_end Read, agent_message, task_done);
+  `python -m app.events` → "OK: 8 events, seq strictly increasing";
+  `GET /tasks/<id>/events` → list of 8, seq 1–8. `npm run build` → build
+  complete.
+- Notes: `tool` is treated as nullable (PLAN.md doesn't say; schema text
+  unchanged). `agent_message` is always `orchestrator`: `AssistantMessage`
+  has `parent_tool_use_id` but no `agent_id` (Phase 5). Whether a guard
+  deny also fires PostToolUseFailure in a live session: unverified; a live
+  deny is still unit-tested only. Pub/sub queues are unbounded; nothing
+  subscribes yet. The `find -newer` check for files outside `tasks/` was
+  not repeated this session: unverified.
+- Next: Phase 4 (`prompts/04-web-ui.md`) in a new session.
+- Open questions: should PLAN.md state that `tool` may be `null`? (Still
+  open: pin a cheaper default model; spend a run on a live hook deny;
+  claude.ai login terms; `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-03 — SG — M3 MacBook Air (session 3)
 - Done: Phase 2 task runner. `app/tasks.py` (task_id
