@@ -3,12 +3,82 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 6 done
+- Phase: 7 done (all phases in PLAN.md done)
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `uv run pytest` → 152 passed; `npm test` → 20 passed;
+- Blockers: none. `uv run pytest` → 242 passed; `npm test` → 20 passed;
   `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-04 — SG — M3 MacBook Air (session 8)
+- Done: Phase 7 hardening. `app/main.py`: `POST /tasks` always creates a
+  `queued` task; a single worker runs `_pending` (deque) FIFO, one at a
+  time (no more 409). `POST /tasks/{id}/cancel`: queued → removed and
+  marked `cancelled` (also a `queued` manifest left from before a restart);
+  running → `runner.request_cancel` (SDK `interrupt()`), waits up to 15 s,
+  then cancels the asyncio task; done/failed/stale `running` → 409.
+  `GET /usage` → today/month totals + `daily_task_cap` +
+  `tasks_created_today`. `DAILY_TASK_CAP` (default 20, `app/config.py`) →
+  429 with message; tasks cancelled before they started don't count.
+  FastAPI lifespan calls `config.check_no_api_key()` → startup fails if the
+  name `ANTHROPIC_API_KEY` is in the environment (value never read).
+  `_existing_task_dir` now 404s a symlinked task dir (audit finding: a
+  symlink in TASKS_DIR with a valid id exposed its target via `/files`).
+  WS stays open while a task is queued. `app/runner.py`: session moved from
+  `query()` to `ClaudeSDKClient` (only the client has `interrupt()`);
+  status `cancelled` (transitions queued/running → cancelled in
+  `tasks.py`); ending event `task_failed` "Task cancelled" (or "… before it
+  started"). New `app/usage.py`: one line per SDK `ResultMessage` in
+  `TASKS_DIR/usage.jsonl` (task_id, recorded_at, status, subtype,
+  duration_ms, duration_api_ms, num_turns, total_cost_usd, usage,
+  model_usage — SDK values as returned); totals sum numeric top-level keys
+  of `usage`. Frontend `app.vue`: input stays enabled ("Queue" while busy,
+  queued count), Cancel button for queued/running, usage panel in the
+  sidebar, ≤720 px stacked layout (not asked for; added for phone use);
+  replay offered for `cancelled` too. New `docs/RUNNING.md` (local run,
+  built frontend with `HOST=127.0.0.1`, `tailscale serve` on 443 → :3000
+  and 8443 → :8000, never funnel). Committed as 462bb6b (not pushed).
+- Verified by: installed SDK 0.2.177 `client.py` (`interrupt()` on
+  `ClaudeSDKClient` only; `query()` docstring: no interrupts) and
+  `types.py` `ResultMessage` fields. `uv run pytest` → 242 passed (new:
+  FIFO order, cancel queued/running/fallback/orphan, 409s, cap, usage
+  totals, startup refusal, 10 bad task_ids × 5 endpoints + WS, symlinked
+  task dir × 5 endpoints + WS → all 400/404). `npm test` → 20 passed;
+  `npm run build` → build complete. `ANTHROPIC_API_KEY=x uv run uvicorn …`
+  → "RuntimeError: ANTHROPIC_API_KEY is set …", "Application startup
+  failed. Exiting.", exit code 3, nothing listening on 8000. Built frontend
+  with `HOST=127.0.0.1 PORT=3123 NUXT_PUBLIC_API_BASE=…` → `lsof` listen
+  127.0.0.1 only, page carries the runtime apiBase. 2 real runs (of 2),
+  backend 127.0.0.1:8000: A, B, C posted → `queued` ×3; C cancelled while
+  queued → 200 `cancelled`, `started_at` null; A cancelled after
+  `subagent_start writer` → 200 `cancelled` in 0.9 s (no "interrupt
+  failed" in log, result `error_during_execution`, no output file); B
+  `queued` while A ran, then `running`, `done` in ~33 s, 6 turns, 26 events
+  (writer + reviewer). `python -m app.events` OK for A (4), B (26), C (1).
+  `GET /usage` today == sums from `usage.jsonl` (5 sessions, 37303 ms, 12
+  turns, $0.1700576 est., identical token sums); month == today.
+- Notes: the first live attempt failed "Not logged in" for all 3 tasks (0
+  tokens, $0): `env -i PATH HOME` drops `USER`, and the CLI needs it to read
+  the Pro login from the macOS keychain. Starting with `USER`/`LOGNAME`
+  fixed it (noted in RUNNING.md). Those 3 tasks (`20261104-062534-*`,
+  `failed`) stay in `tasks/` and in `usage.jsonl`; they count toward
+  today's cap (5/20 after the demo). Usage today/month uses local time (task
+  ids too); event `ts` stays Asia/Singapore. `.env` is not loaded by
+  `config.py`; `DAILY_TASK_CAP` not added to `.env.example` (outside
+  scope). Queued tasks are in memory only: after a restart they stay
+  `queued` until cancelled. Stale `running` manifests still can't be
+  cancelled (409). Unverified: usage panel, Cancel button and phone layout
+  in a browser (build only); `tailscale serve` (not run) and whether it
+  proxies the WebSocket (docs silent).
+- Next: run the app from my phone over the tailnet per `docs/RUNNING.md`
+  (I run the `tailscale serve` commands myself). No Phase 8 prompt exists.
+- Open questions: add a `task_cancelled` event type to PLAN.md instead of
+  `task_failed` "Task cancelled"? Add `DAILY_TASK_CAP`/`FRONTEND_ORIGIN` to
+  `.env.example`? Should restart re-queue `queued` manifests or let me cancel
+  stale `running` ones? (Still open: keep Node's test runner or vitest;
+  manifest `agents` shape in PLAN.md; `tool` may be `null` in PLAN.md; pin a
+  cheaper default model; live hook deny; claude.ai login terms;
+  `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-04 — SG — M3 MacBook Air (session 7)
 - Done: Phase 6 2D office. `frontend/app/utils/officeState.ts`: pure
