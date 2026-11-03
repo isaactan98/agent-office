@@ -287,6 +287,13 @@ onBeforeUnmount(() => {
         <p v-if="selectedTask" class="task-prompt">{{ selectedTask.text }}</p>
         <p v-if="selectedTask?.error" class="error">{{ selectedTask.error }}</p>
 
+        <Office
+          :key="selectedId"
+          :task-id="selectedId"
+          :events="feed"
+          :finished="selectedTask?.status === 'done' || selectedTask?.status === 'failed'"
+        />
+
         <div class="legend">
           <span v-for="name in AGENTS" :key="name" class="agent-tag" :class="`a-${name}`">{{ name }}</span>
           <span class="agent-tag a-other">other</span>
