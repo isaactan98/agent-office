@@ -11,7 +11,7 @@ import type { Character, OfficeEvent, OfficeState } from '~/utils/officeState'
 const props = defineProps<{
   taskId: string
   events: OfficeEvent[] // the live feed (past events first, then new ones)
-  finished: boolean // replay is offered for done / failed tasks only
+  finished: boolean // replay is offered for done / failed / cancelled tasks only
 }>()
 
 const apiBase = useRuntimeConfig().public.apiBase as string

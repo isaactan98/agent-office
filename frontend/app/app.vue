@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Single page: task input, live event feed, task list, file viewer.
+// Single page: task input, live event feed, task list, file viewer, usage.
 // Data is loaded in the browser only (onMounted), never during SSR.
 
 interface Task {
@@ -28,6 +28,21 @@ interface TaskFile {
   size: number
 }
 
+// GET /usage. `usage` holds summed numeric fields of the SDK's raw usage dicts.
+interface UsageTotals {
+  sessions: number
+  duration_ms: number
+  num_turns: number
+  total_cost_usd: number
+  usage: Record<string, number>
+}
+interface Usage {
+  today: UsageTotals
+  month: UsageTotals
+  daily_task_cap: number
+  tasks_created_today: number
+}
+
 const KNOWN_TYPES = new Set([
   'task_queued', 'task_started', 'agent_message', 'tool_start', 'tool_end',
   'tool_denied', 'subagent_start', 'subagent_stop', 'task_done', 'task_failed'
@@ -51,6 +66,9 @@ const openFile = ref<{ path: string, content: string | null, error: string | nul
 const input = ref('')
 const sending = ref(false)
 const sendError = ref<string | null>(null)
+const cancelling = ref(false)
+const cancelError = ref<string | null>(null)
+const usage = ref<Usage | null>(null)
 
 const feedEl = ref<HTMLElement | null>(null)
 let stickToBottom = true
@@ -61,6 +79,7 @@ let pollTimer: ReturnType<typeof setInterval> | undefined
 const runningTask = computed(() =>
   tasks.value.find(t => t.status === 'running' || t.status === 'queued') ?? null
 )
+const queuedCount = computed(() => tasks.value.filter(t => t.status === 'queued').length)
 const selectedTask = computed(() =>
   tasks.value.find(t => t.task_id === selectedId.value) ?? null
 )
@@ -76,6 +95,14 @@ async function refreshTasks() {
     tasks.value = await $fetch<Task[]>(`${apiBase}/tasks`)
   } catch (err) {
     console.error('could not load tasks', err)
+  }
+}
+
+async function refreshUsage() {
+  try {
+    usage.value = await $fetch<Usage>(`${apiBase}/usage`)
+  } catch (err) {
+    console.error('could not load usage', err)
   }
 }
 
@@ -137,6 +164,7 @@ function connect(taskId: string) {
     feed.value.push(event)
     if (event.type && TERMINAL_TYPES.has(event.type)) {
       refreshTasks()
+      refreshUsage()
       loadFiles(taskId)
     } else if (event.type === 'tool_end') {
       loadFiles(taskId) // a tool may have written a file
@@ -160,6 +188,7 @@ function selectTask(taskId: string) {
   stickToBottom = true
   files.value = []
   openFile.value = null
+  cancelError.value = null
   // Keep the open task in the URL so a reload comes back to it.
   const url = new URL(window.location.href)
   url.searchParams.set('task', taskId)
@@ -180,12 +209,29 @@ async function send() {
     })
     input.value = ''
     await refreshTasks()
+    refreshUsage()
     selectTask(created.task_id)
   } catch (err) {
-    sendError.value = errorText(err) // e.g. "409: a task is already running"
+    sendError.value = errorText(err) // e.g. "429: daily task cap reached …"
     refreshTasks()
   } finally {
     sending.value = false
+  }
+}
+
+// Cancel a queued or running task. The backend answers once it is cancelled.
+async function cancelTask(taskId: string) {
+  if (cancelling.value) return
+  cancelling.value = true
+  cancelError.value = null
+  try {
+    await $fetch(`${apiBase}/tasks/${taskId}/cancel`, { method: 'POST' })
+  } catch (err) {
+    cancelError.value = errorText(err)
+  } finally {
+    cancelling.value = false
+    refreshTasks()
+    refreshUsage()
   }
 }
 
@@ -220,8 +266,24 @@ function formatSize(bytes: number): string {
   return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`
 }
 
+function formatDuration(ms: number): string {
+  const minutes = Math.floor(ms / 60000)
+  const seconds = Math.round((ms % 60000) / 1000)
+  return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`
+}
+
+// Token fields of the SDK's usage dict (e.g. input_tokens). The month includes today.
+function tokenKeys(totals: UsageTotals): string[] {
+  return Object.keys(totals.usage).filter(key => key.endsWith('_tokens'))
+}
+
+function tokenLabel(key: string): string {
+  return key.replace(/_tokens$/, '').replace(/_/g, ' ') // cache_read_input_tokens -> "cache read input"
+}
+
 onMounted(async () => {
   await refreshTasks()
+  refreshUsage()
   const fromUrl = new URLSearchParams(window.location.search).get('task')
   const initial = fromUrl ?? runningTask.value?.task_id
   if (initial) selectTask(initial)
@@ -241,6 +303,37 @@ onBeforeUnmount(() => {
   <div class="layout">
     <aside class="sidebar">
       <h1>agent-office</h1>
+      <section v-if="usage" class="usage">
+        <h2>Usage</h2>
+        <p :class="{ error: usage.tasks_created_today >= usage.daily_task_cap }">
+          Tasks today: {{ usage.tasks_created_today }} / {{ usage.daily_task_cap }}
+        </p>
+        <table>
+          <thead>
+            <tr><th /><th>today</th><th>month</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>sessions</td><td>{{ usage.today.sessions }}</td><td>{{ usage.month.sessions }}</td></tr>
+            <tr><td>turns</td><td>{{ usage.today.num_turns }}</td><td>{{ usage.month.num_turns }}</td></tr>
+            <tr>
+              <td>time</td>
+              <td>{{ formatDuration(usage.today.duration_ms) }}</td>
+              <td>{{ formatDuration(usage.month.duration_ms) }}</td>
+            </tr>
+            <tr v-for="key in tokenKeys(usage.month)" :key="key">
+              <td>{{ tokenLabel(key) }}</td>
+              <td>{{ (usage.today.usage[key] ?? 0).toLocaleString() }}</td>
+              <td>{{ (usage.month.usage[key] ?? 0).toLocaleString() }}</td>
+            </tr>
+            <tr>
+              <td>est. $</td>
+              <td>{{ usage.today.total_cost_usd.toFixed(2) }}</td>
+              <td>{{ usage.month.total_cost_usd.toFixed(2) }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="muted small">est. $ = the SDK's list-price estimate, not a bill (Pro plan).</p>
+      </section>
       <p v-if="tasks.length === 0" class="muted">No tasks yet.</p>
       <ul class="task-list">
         <li
@@ -262,15 +355,16 @@ onBeforeUnmount(() => {
           v-model="input"
           rows="3"
           placeholder="Describe a task…"
-          :disabled="!!runningTask || sending"
+          :disabled="sending"
           @keydown.enter.meta.prevent="send"
         />
         <div class="chat-row">
-          <button type="submit" :disabled="!!runningTask || sending || !input.trim()">
-            Send
+          <button type="submit" :disabled="sending || !input.trim()">
+            {{ runningTask ? 'Queue' : 'Send' }}
           </button>
           <span v-if="runningTask" class="muted">
-            Disabled: a task is already running ({{ runningTask.task_id }}).
+            A task is running<template v-if="queuedCount">, {{ queuedCount }} queued</template>.
+            New tasks wait in the queue.
           </span>
           <span v-if="sendError" class="error">{{ sendError }}</span>
         </div>
@@ -283,7 +377,16 @@ onBeforeUnmount(() => {
             {{ selectedTask.status }}
           </span>
           <span class="muted">feed: {{ connection }}</span>
+          <button
+            v-if="selectedTask && (selectedTask.status === 'queued' || selectedTask.status === 'running')"
+            class="cancel"
+            :disabled="cancelling"
+            @click="cancelTask(selectedTask.task_id)"
+          >
+            {{ cancelling ? 'Cancelling…' : 'Cancel' }}
+          </button>
         </header>
+        <p v-if="cancelError" class="error">{{ cancelError }}</p>
         <p v-if="selectedTask" class="task-prompt">{{ selectedTask.text }}</p>
         <p v-if="selectedTask?.error" class="error">{{ selectedTask.error }}</p>
 
@@ -291,7 +394,7 @@ onBeforeUnmount(() => {
           :key="selectedId"
           :task-id="selectedId"
           :events="feed"
-          :finished="selectedTask?.status === 'done' || selectedTask?.status === 'failed'"
+          :finished="['done', 'failed', 'cancelled'].includes(selectedTask?.status ?? '')"
         />
 
         <div class="legend">
@@ -416,7 +519,25 @@ h2 { font-size: 14px; margin: 0 0 8px; }
 }
 .chat button:disabled { background: #94d3a2; border-color: #94d3a2; cursor: not-allowed; }
 
-.task-header { display: flex; gap: 12px; align-items: center; font-family: ui-monospace, monospace; }
+.task-header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-family: ui-monospace, monospace; }
+.task-header strong { word-break: break-all; }
+.cancel {
+  font: inherit;
+  padding: 2px 10px;
+  border: 1px solid #cf222e;
+  border-radius: 6px;
+  background: #fff;
+  color: #cf222e;
+  cursor: pointer;
+}
+.cancel:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.usage { margin-bottom: 16px; font-size: 12px; }
+.usage p { margin: 0 0 6px; }
+.usage table { border-collapse: collapse; width: 100%; }
+.usage th, .usage td { text-align: right; padding: 1px 4px; font-variant-numeric: tabular-nums; }
+.usage th:first-child, .usage td:first-child { text-align: left; color: #6e7781; }
+.small { font-size: 11px; }
 .task-prompt { margin: 8px 0; }
 
 .feed {
@@ -480,6 +601,16 @@ h2 { font-size: 14px; margin: 0 0 8px; }
 }
 .link.selected { font-weight: 700; }
 .file-view { flex: 1; min-width: 0; }
+/* Phone width: sidebar above the main column. */
+@media (max-width: 720px) {
+  .layout { flex-direction: column; }
+  .sidebar { width: auto; max-height: 40vh; position: static; border-right: none; border-bottom: 1px solid #d0d7de; }
+  .files { flex-direction: column; }
+  .file-list { width: auto; }
+  .row { grid-template-columns: 56px 80px 1fr; }
+  .row .summary { grid-column: 1 / -1; }
+}
+
 .file-view pre {
   margin: 0;
   padding: 12px;

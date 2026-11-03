@@ -4,8 +4,12 @@ sandboxed to its task directory.
 SDK option names were verified in Phase 1 (backend/spikes/README.md). Subagent
 events come from the SDK's SubagentStart/SubagentStop hooks; tool hooks carry
 agent_id/agent_type when they fire inside a subagent.
+
+The session uses ClaudeSDKClient, not query(): only the client has interrupt(),
+which is how a running task is cancelled.
 """
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -14,13 +18,13 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     HookMatcher,
     ResultMessage,
     TextBlock,
-    query,
 )
 
-from app import agents, events, tasks
+from app import agents, events, tasks, usage
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +43,14 @@ Task:
 """
 
 GLOB_CHARS = set("*?[{")
+
+# Tasks asked to stop, and the SDK client of each running session.
+_cancel_requested: set[str] = set()
+_clients: dict[str, ClaudeSDKClient] = {}
+
+
+class Cancelled(Exception):
+    """The task was cancelled while running."""
 
 
 def is_path_inside(path: str, task_dir: Path) -> bool:
@@ -283,33 +295,79 @@ def build_options(task_dir: Path, emitter: events.EventEmitter) -> ClaudeAgentOp
     )
 
 
-async def run_task(task_id: str) -> None:
-    """Run the task. Ends with status 'done' (summary.md written) or 'failed'.
+def cancel_queued(task_id: str) -> dict[str, Any]:
+    """Mark a task that never started as cancelled. Emits task_failed so a watching
+    feed knows it ended (the event schema has no task_cancelled type)."""
+    _cancel_requested.discard(task_id)
+    manifest = tasks.set_status(task_id, "cancelled")
+    emitter = events.EventEmitter(task_id, tasks.task_dir(task_id))
+    emit_safely(emitter, "task_failed", "Task cancelled before it started")
+    return manifest
 
-    Events go to events.jsonl: task_started first, task_done or task_failed last.
+
+async def request_cancel(task_id: str) -> None:
+    """Ask the running session of task_id to stop; run_task then ends as 'cancelled'.
+
+    Sends the SDK's interrupt if the session is connected. If it is still
+    connecting, run_task sees the request and does not send the prompt.
+    Raises if the interrupt cannot be sent.
     """
+    _cancel_requested.add(task_id)
+    client = _clients.get(task_id)
+    if client is not None:
+        await client.interrupt()
+
+
+def _end_cancelled(task_id: str, emitter: events.EventEmitter) -> None:
+    try:
+        tasks.set_status(task_id, "cancelled")
+    except Exception:
+        log.exception("could not mark %s cancelled", task_id)
+    emit_safely(emitter, "task_failed", "Task cancelled")
+
+
+async def run_task(task_id: str) -> None:
+    """Run the task. Ends with status 'done' (summary.md written), 'failed' or
+    'cancelled'. If the SDK returned a result, one line goes to usage.jsonl.
+
+    Events go to events.jsonl: task_started first, task_done or task_failed last
+    (a cancelled task ends with task_failed "Task cancelled").
+    """
+    if task_id in _cancel_requested:  # cancelled before it started
+        cancel_queued(task_id)
+        return
     task_dir = tasks.task_dir(task_id)
     emitter = events.EventEmitter(task_id, task_dir)
     manifest = tasks.set_status(task_id, "running")
     emit_safely(emitter, "task_started", "Task started")
+    result: ResultMessage | None = None
     try:
         # Check presence only; never read or print the value.
         if "ANTHROPIC_API_KEY" in os.environ:
             raise RuntimeError("ANTHROPIC_API_KEY is set in the environment. Refusing to run.")
         tasks.record_agent_run(task_id, agents.ORCHESTRATOR)
 
-        result: ResultMessage | None = None
         prompt = PROMPT_TEMPLATE.format(text=manifest["text"])
-        async for message in query(prompt=prompt, options=build_options(task_dir, emitter)):
-            # Subagent text is not forwarded (forward_subagent_text is off); messages
-            # with a parent_tool_use_id carry only a subagent's tool blocks.
-            if isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        emit_safely(emitter, "agent_message", block.text)
-            elif isinstance(message, ResultMessage):
-                result = message
+        async with ClaudeSDKClient(options=build_options(task_dir, emitter)) as client:
+            _clients[task_id] = client
+            try:
+                if task_id not in _cancel_requested:  # not cancelled while connecting
+                    await client.query(prompt)
+                    async for message in client.receive_response():
+                        # Subagent text is not forwarded (forward_subagent_text is off);
+                        # messages with a parent_tool_use_id carry only a subagent's
+                        # tool blocks.
+                        if isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
+                            for block in message.content:
+                                if isinstance(block, TextBlock) and block.text.strip():
+                                    emit_safely(emitter, "agent_message", block.text)
+                        elif isinstance(message, ResultMessage):
+                            result = message
+            finally:
+                del _clients[task_id]
 
+        if task_id in _cancel_requested:
+            raise Cancelled()
         if result is None:
             raise RuntimeError("SDK session ended without a result")
         if result.is_error or result.subtype != "success":
@@ -320,7 +378,18 @@ async def run_task(task_id: str) -> None:
             summary.write_text((result.result or "") + "\n")
         tasks.set_status(task_id, "done")
         emit_safely(emitter, "task_done", f"Task done in {result.num_turns} turns")
+    except (Cancelled, asyncio.CancelledError) as exc:
+        _end_cancelled(task_id, emitter)
+        if isinstance(exc, asyncio.CancelledError):
+            raise  # the asyncio task itself was cancelled: let it end
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        tasks.set_status(task_id, "failed", error=error)
-        emit_safely(emitter, "task_failed", f"Task failed: {error}")
+        if task_id in _cancel_requested:  # the interrupt made the session fail
+            _end_cancelled(task_id, emitter)
+        else:
+            error = f"{type(exc).__name__}: {exc}"
+            tasks.set_status(task_id, "failed", error=error)
+            emit_safely(emitter, "task_failed", f"Task failed: {error}")
+    finally:
+        _cancel_requested.discard(task_id)
+        if result is not None:
+            usage.record(task_id, result)

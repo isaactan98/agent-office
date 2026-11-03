@@ -7,7 +7,7 @@ import os
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from app import agents, events, runner, tasks
+from app import agents, events, runner, tasks, usage
 
 
 @pytest.fixture
@@ -390,7 +390,7 @@ def fake_result(**kwargs) -> ResultMessage:
 
 
 def fake_query(*messages, raises: Exception | None = None):
-    async def _query(prompt, options):
+    async def _query(prompt, options, client):
         for message in messages:
             yield message
         if raises:
@@ -403,20 +403,21 @@ def no_api_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
 
-def test_run_task_done_writes_summary(tasks_dir, monkeypatch, no_api_key) -> None:
-    monkeypatch.setattr(runner, "query", fake_query(fake_result()))
+def test_run_task_done_writes_summary(tasks_dir, fake_sdk, no_api_key) -> None:
+    fake = fake_sdk(fake_query(fake_result()))
     task_id = tasks.create_task("hello")["task_id"]
     asyncio.run(runner.run_task(task_id))
+    assert "hello" in fake.instances[0].prompt
     manifest = tasks.read_manifest(task_id)
     assert manifest["status"] == "done"
     assert (tasks_dir / task_id / "summary.md").read_text() == "Wrote output/hello.md\n"
     assert [e["type"] for e in logged(tasks_dir / task_id)] == ["task_started", "task_done"]
 
 
-def test_run_task_event_sequence(tasks_dir, monkeypatch, no_api_key) -> None:
+def test_run_task_event_sequence(tasks_dir, fake_sdk, no_api_key) -> None:
     """A fake session that calls the registered hooks the way the CLI would."""
 
-    async def _query(prompt, options):
+    async def _query(prompt, options, client):
         pre = options.hooks["PreToolUse"][0].hooks[0]
         post = options.hooks["PostToolUse"][0].hooks[0]
         write = {"file_path": "output/hello.md", "content": "hi"}
@@ -426,7 +427,7 @@ def test_run_task_event_sequence(tasks_dir, monkeypatch, no_api_key) -> None:
         await pre(hook_input("PreToolUse", "Write", {"file_path": "../x.md"}), "tu2", {"signal": None})
         yield fake_result()
 
-    monkeypatch.setattr(runner, "query", _query)
+    fake_sdk(_query)
     task_id = tasks.create_task("hello")["task_id"]
     asyncio.run(runner.run_task(task_id))
     file = tasks_dir / task_id / "events.jsonl"
@@ -439,10 +440,10 @@ def test_run_task_event_sequence(tasks_dir, monkeypatch, no_api_key) -> None:
     assert {e.task_id for e in checked} == {task_id}
 
 
-def test_run_task_orchestrator_and_subagents(tasks_dir, monkeypatch, no_api_key) -> None:
+def test_run_task_orchestrator_and_subagents(tasks_dir, fake_sdk, no_api_key) -> None:
     """A fake session that delegates to writer and reviewer the way the CLI would."""
 
-    async def _query(prompt, options):
+    async def _query(prompt, options, client):
         hooks = {name: matchers[0].hooks[0] for name, matchers in options.hooks.items()}
         ctx = {"signal": None}
 
@@ -468,7 +469,7 @@ def test_run_task_orchestrator_and_subagents(tasks_dir, monkeypatch, no_api_key)
         (tasks_dir / task_id / "summary.md").write_text("orchestrator summary\n")
         yield fake_result(result="final text")
 
-    monkeypatch.setattr(runner, "query", _query)
+    fake_sdk(_query)
     task_id = tasks.create_task("route")["task_id"]
     asyncio.run(runner.run_task(task_id))
     checked = events.validate_file(tasks_dir / task_id / "events.jsonl")
@@ -487,8 +488,8 @@ def test_run_task_orchestrator_and_subagents(tasks_dir, monkeypatch, no_api_key)
     assert (tasks_dir / task_id / "summary.md").read_text() == "orchestrator summary\n"
 
 
-def test_run_task_exception_marks_failed(tasks_dir, monkeypatch, no_api_key) -> None:
-    monkeypatch.setattr(runner, "query", fake_query(raises=ConnectionError("cli died")))
+def test_run_task_exception_marks_failed(tasks_dir, fake_sdk, no_api_key) -> None:
+    fake_sdk(fake_query(raises=ConnectionError("cli died")))
     task_id = tasks.create_task("hello")["task_id"]
     asyncio.run(runner.run_task(task_id))
     manifest = tasks.read_manifest(task_id)
@@ -499,20 +500,135 @@ def test_run_task_exception_marks_failed(tasks_dir, monkeypatch, no_api_key) -> 
     assert types == ["task_started", "task_failed"]
 
 
-def test_run_task_error_result_marks_failed(tasks_dir, monkeypatch, no_api_key) -> None:
+def test_run_task_error_result_marks_failed(tasks_dir, fake_sdk, no_api_key) -> None:
     result = fake_result(subtype="error_max_turns", is_error=True, result=None)
-    monkeypatch.setattr(runner, "query", fake_query(result))
+    fake_sdk(fake_query(result))
     task_id = tasks.create_task("hello")["task_id"]
     asyncio.run(runner.run_task(task_id))
     manifest = tasks.read_manifest(task_id)
     assert manifest["status"] == "failed" and "error_max_turns" in manifest["error"]
 
 
-def test_run_task_refuses_with_api_key_set(tasks_dir, monkeypatch) -> None:
-    called = []
-    monkeypatch.setattr(runner, "query", lambda **kw: called.append(kw))
+def test_run_task_refuses_with_api_key_set(tasks_dir, monkeypatch, fake_sdk) -> None:
+    fake = fake_sdk(fake_query(fake_result()))
     monkeypatch.setitem(os.environ, "ANTHROPIC_API_KEY", "dummy-not-a-real-key")
     task_id = tasks.create_task("hello")["task_id"]
     asyncio.run(runner.run_task(task_id))
     assert tasks.read_manifest(task_id)["status"] == "failed"
-    assert called == []
+    assert fake.instances == []
+
+
+def test_run_task_records_usage(tasks_dir, fake_sdk, no_api_key) -> None:
+    raw = {"input_tokens": 10, "output_tokens": 5, "service_tier": "standard"}
+    fake_sdk(fake_query(fake_result(duration_ms=1200, num_turns=3, total_cost_usd=0.02, usage=raw)))
+    task_id = tasks.create_task("hello")["task_id"]
+    asyncio.run(runner.run_task(task_id))
+    [entry] = usage.read_entries()
+    assert entry["task_id"] == task_id and entry["status"] == "done"
+    assert (entry["duration_ms"], entry["num_turns"], entry["total_cost_usd"]) == (1200, 3, 0.02)
+    assert entry["usage"] == raw  # stored as the SDK returned it
+    assert entry["model_usage"] is None
+
+
+def test_run_task_without_result_records_no_usage(tasks_dir, fake_sdk, no_api_key) -> None:
+    fake_sdk(fake_query(raises=ConnectionError("cli died")))
+    asyncio.run(runner.run_task(tasks.create_task("hello")["task_id"]))
+    assert usage.read_entries() == []
+
+
+# --- cancel ---------------------------------------------------------------
+
+
+async def _wait_for_client(task_id: str) -> None:
+    while task_id not in runner._clients:
+        await asyncio.sleep(0.01)
+
+
+def test_cancel_running_task_interrupts_session(tasks_dir, fake_sdk, no_api_key) -> None:
+    """The session stops after interrupt() and returns an error result, as the CLI does."""
+
+    async def _query(prompt, options, client):
+        yield AssistantMessage(content=[TextBlock(text="Working on it")], model="m")
+        await client.interrupted.wait()
+        yield fake_result(subtype="error_during_execution", is_error=True, result=None,
+                          usage={"input_tokens": 3})
+
+    fake = fake_sdk(_query)
+    task_id = tasks.create_task("hello")["task_id"]
+
+    async def scenario():
+        run = asyncio.create_task(runner.run_task(task_id))
+        await _wait_for_client(task_id)
+        await runner.request_cancel(task_id)
+        await run
+
+    asyncio.run(scenario())
+    assert fake.instances[0].interrupted.is_set()
+    manifest = tasks.read_manifest(task_id)
+    assert manifest["status"] == "cancelled" and manifest["error"] is None
+    types = [(e["type"], e["summary"]) for e in logged(tasks_dir / task_id)]
+    assert types == [("task_started", "Task started"), ("agent_message", "Working on it"),
+                     ("task_failed", "Task cancelled")]
+    [entry] = usage.read_entries()
+    assert entry["status"] == "cancelled" and entry["usage"] == {"input_tokens": 3}
+    assert runner._cancel_requested == set() and runner._clients == {}
+
+
+def test_cancel_before_start(tasks_dir, fake_sdk, no_api_key) -> None:
+    fake = fake_sdk(fake_query(fake_result()))
+    task_id = tasks.create_task("hello")["task_id"]
+
+    async def scenario():
+        await runner.request_cancel(task_id)  # no session yet: only marks it
+        await runner.run_task(task_id)
+
+    asyncio.run(scenario())
+    manifest = tasks.read_manifest(task_id)
+    assert manifest["status"] == "cancelled" and manifest["started_at"] is None
+    assert fake.instances == []
+    assert [e["summary"] for e in logged(tasks_dir / task_id)] == ["Task cancelled before it started"]
+
+
+def test_cancel_while_connecting_skips_prompt(tasks_dir, fake_sdk, no_api_key) -> None:
+    fake = fake_sdk(fake_query(fake_result()))
+    original_enter = fake.__aenter__
+
+    async def enter_and_cancel(self):
+        runner._cancel_requested.add(self.options.cwd.name)  # cancel arrives mid-connect
+        return await original_enter(self)
+
+    fake.__aenter__ = enter_and_cancel
+    task_id = tasks.create_task("hello")["task_id"]
+    asyncio.run(runner.run_task(task_id))
+    assert fake.instances[0].prompt is None
+    assert tasks.read_manifest(task_id)["status"] == "cancelled"
+
+
+def test_asyncio_cancel_marks_cancelled(tasks_dir, fake_sdk, no_api_key) -> None:
+    """Fallback when the session ignores the interrupt: the asyncio task is cancelled."""
+
+    async def _query(prompt, options, client):
+        await asyncio.Event().wait()  # never ends on its own
+        yield fake_result()
+
+    fake_sdk(_query)
+    task_id = tasks.create_task("hello")["task_id"]
+
+    async def scenario():
+        run = asyncio.create_task(runner.run_task(task_id))
+        await _wait_for_client(task_id)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    asyncio.run(scenario())
+    assert tasks.read_manifest(task_id)["status"] == "cancelled"
+    assert [e["type"] for e in logged(tasks_dir / task_id)][-1] == "task_failed"
+    assert runner._clients == {}
+
+
+def test_status_cancelled_transitions(tasks_dir) -> None:
+    task_id = tasks.create_task("hello")["task_id"]
+    assert tasks.set_status(task_id, "cancelled")["status"] == "cancelled"
+    with pytest.raises(ValueError):
+        tasks.set_status(task_id, "running")

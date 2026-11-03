@@ -1,13 +1,16 @@
 """Endpoint tests. runner.run_task is replaced, so the real SDK is never called."""
 
 import asyncio
+import json
+import os
 import time
+from collections import deque
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from app import config, events, main, runner, tasks
+from app import config, events, main, runner, tasks, usage
 
 
 @pytest.fixture
@@ -19,6 +22,9 @@ def client(tasks_dir, monkeypatch):
 
     monkeypatch.setattr(runner, "run_task", fake_run_task)
     monkeypatch.setattr(main, "_running", None)
+    monkeypatch.setattr(main, "_worker", None)
+    monkeypatch.setattr(main, "_pending", deque())
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with TestClient(main.app) as c:
         c.calls = calls
         yield c
@@ -37,13 +43,57 @@ def test_post_rejects_empty_text(client) -> None:
     assert client.post("/tasks", json={"text": ""}).status_code == 422
 
 
-def test_post_409_while_running(client, monkeypatch) -> None:
-    class Busy:
-        def done(self) -> bool:
-            return False
+def wait_until(condition, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
 
-    monkeypatch.setattr(main, "_running", Busy())
-    assert client.post("/tasks", json={"text": "second"}).status_code == 409
+
+@pytest.fixture
+def gated(client, monkeypatch):
+    """run_task replaced by one that runs until `gate.open` is set, like a real
+    task (queued -> running -> done). `started` lists task_ids in run order."""
+
+    class Gate:
+        open = False
+        started: list[str] = []
+
+    gate = Gate()
+
+    async def gated_run_task(task_id: str) -> None:
+        gate.started.append(task_id)
+        tasks.set_status(task_id, "running")
+        while not gate.open:
+            await asyncio.sleep(0.01)
+        tasks.set_status(task_id, "done")
+
+    monkeypatch.setattr(runner, "run_task", gated_run_task)
+    return gate
+
+
+def status_of(client, task_id: str) -> str:
+    return client.get(f"/tasks/{task_id}").json()["status"]
+
+
+def test_second_task_is_queued_then_runs(client, gated) -> None:
+    first = client.post("/tasks", json={"text": "first"}).json()
+    second = client.post("/tasks", json={"text": "second"})
+    assert second.status_code == 200 and second.json()["status"] == "queued"
+    second_id = second.json()["task_id"]
+    wait_until(lambda: gated.started == [first["task_id"]])
+    assert status_of(client, first["task_id"]) == "running"
+    assert status_of(client, second_id) == "queued"
+    gated.open = True
+    wait_until(lambda: status_of(client, second_id) == "done")
+    assert gated.started == [first["task_id"], second_id]  # FIFO
+
+
+def test_tasks_run_in_fifo_order(client, gated) -> None:
+    ids = [client.post("/tasks", json={"text": f"t{i}"}).json()["task_id"] for i in range(3)]
+    gated.open = True
+    wait_until(lambda: len(gated.started) == 3)
+    assert gated.started == ids
 
 
 def test_list_tasks(client) -> None:
@@ -262,4 +312,284 @@ def test_ws_rejects_other_origin(client) -> None:
 def test_ws_rejects_bad_or_missing_task(client, bad) -> None:
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect(f"/ws/tasks/{bad}") as ws:
+            ws.receive_json()
+
+
+# --- cancel -----------------------------------------------------------------
+
+
+def test_cancel_queued_task(client, gated, tasks_dir) -> None:
+    first = client.post("/tasks", json={"text": "first"}).json()["task_id"]
+    second = client.post("/tasks", json={"text": "second"}).json()["task_id"]
+    response = client.post(f"/tasks/{second}/cancel")
+    assert response.status_code == 200
+    assert response.json() == {"task_id": second, "status": "cancelled"}
+    manifest = tasks.read_manifest(second)
+    assert manifest["status"] == "cancelled" and manifest["started_at"] is None
+    assert [e["type"] for e in events.read_events(tasks_dir / second)] == ["task_failed"]
+    gated.open = True
+    wait_until(lambda: status_of(client, first) == "done")
+    time.sleep(0.1)
+    assert gated.started == [first]  # the cancelled task never ran
+
+
+def test_cancel_queued_task_left_from_before_restart(client) -> None:
+    """A manifest still 'queued' that this process does not know about."""
+    task_id = tasks.create_task("orphan")["task_id"]
+    assert client.post(f"/tasks/{task_id}/cancel").json()["status"] == "cancelled"
+
+
+def interruptible_session(ignore_interrupt: bool = False):
+    async def session(prompt, options, client):
+        if ignore_interrupt:
+            await asyncio.Event().wait()
+        await client.interrupted.wait()
+        from claude_agent_sdk import ResultMessage
+        yield ResultMessage(subtype="error_during_execution", duration_ms=5, duration_api_ms=4,
+                            is_error=True, num_turns=1, session_id="s", usage={"input_tokens": 7})
+    return session
+
+
+@pytest.fixture
+def real_runner(client, monkeypatch):
+    """Use the real runner.run_task (with a fake SDK client) instead of the fake."""
+    monkeypatch.setattr(runner, "run_task", RUN_TASK)
+
+
+RUN_TASK = runner.run_task
+
+
+def test_cancel_running_task_interrupts(client, real_runner, fake_sdk, tasks_dir) -> None:
+    fake = fake_sdk(interruptible_session())
+    task_id = client.post("/tasks", json={"text": "long"}).json()["task_id"]
+    wait_until(lambda: task_id in runner._clients)
+    response = client.post(f"/tasks/{task_id}/cancel")
+    assert response.json() == {"task_id": task_id, "status": "cancelled"}
+    assert fake.instances[0].interrupted.is_set()
+    assert events.read_events(tasks_dir / task_id)[-1]["summary"] == "Task cancelled"
+    assert [e["status"] for e in usage.read_entries()] == ["cancelled"]
+
+
+def test_cancel_running_task_falls_back_to_asyncio_cancel(
+    client, real_runner, fake_sdk, monkeypatch
+) -> None:
+    monkeypatch.setattr(main, "CANCEL_WAIT_SECONDS", 0.2)
+    fake_sdk(interruptible_session(ignore_interrupt=True))
+    task_id = client.post("/tasks", json={"text": "stuck"}).json()["task_id"]
+    wait_until(lambda: task_id in runner._clients)
+    assert client.post(f"/tasks/{task_id}/cancel").json()["status"] == "cancelled"
+
+
+def test_cancel_running_then_next_task_runs(client, real_runner, fake_sdk) -> None:
+    fake_sdk(interruptible_session())
+    first = client.post("/tasks", json={"text": "first"}).json()["task_id"]
+    second = client.post("/tasks", json={"text": "second"}).json()["task_id"]
+    wait_until(lambda: first in runner._clients)
+    client.post(f"/tasks/{first}/cancel")
+    wait_until(lambda: second in runner._clients)
+    assert status_of(client, second) == "running"
+    client.post(f"/tasks/{second}/cancel")
+    assert status_of(client, second) == "cancelled"
+
+
+@pytest.mark.parametrize("status", ["done", "failed"])
+def test_cancel_finished_task_is_409(client, status) -> None:
+    task_id = tasks.create_task("x")["task_id"]
+    tasks.set_status(task_id, "running")
+    tasks.set_status(task_id, status)
+    assert client.post(f"/tasks/{task_id}/cancel").status_code == 409
+
+
+def test_cancel_stale_running_task_is_409(client) -> None:
+    """'running' in the manifest but not running in this process (after a crash)."""
+    task_id = tasks.create_task("x")["task_id"]
+    tasks.set_status(task_id, "running")
+    assert client.post(f"/tasks/{task_id}/cancel").status_code == 409
+
+
+def test_ws_for_queued_task_stays_open_until_cancelled(client, gated) -> None:
+    client.post("/tasks", json={"text": "first"})
+    second = client.post("/tasks", json={"text": "second"}).json()["task_id"]
+    with client.websocket_connect(f"/ws/tasks/{second}") as ws:
+        time.sleep(main.WS_POLL_SECONDS + 0.5)  # a non-active task would be closed by now
+        client.post(f"/tasks/{second}/cancel")
+        received = _receive_all(ws)
+    assert [(e["type"], e["summary"]) for e in received] == [
+        ("task_failed", "Task cancelled before it started")]
+    gated.open = True
+
+
+# --- daily cap --------------------------------------------------------------
+
+
+def test_daily_cap_429(client, monkeypatch) -> None:
+    monkeypatch.setattr(config, "DAILY_TASK_CAP", 2)
+    assert client.post("/tasks", json={"text": "a"}).status_code == 200
+    assert client.post("/tasks", json={"text": "b"}).status_code == 200
+    response = client.post("/tasks", json={"text": "c"})
+    assert response.status_code == 429
+    assert "daily task cap reached (2 tasks today)" in response.json()["detail"]
+    assert len(tasks.list_manifests()) == 2  # nothing was created
+
+
+def test_daily_cap_skips_cancelled_before_start_and_other_days(client, monkeypatch, tasks_dir) -> None:
+    monkeypatch.setattr(config, "DAILY_TASK_CAP", 1)
+    old = tasks_dir / "20200101-000000-old"
+    old.mkdir(parents=True)
+    (old / "manifest.json").write_text(json.dumps(
+        {"task_id": old.name, "status": "done", "started_at": "x"}))
+    task_id = tasks.create_task("never ran")["task_id"]
+    tasks.set_status(task_id, "cancelled")
+    assert client.post("/tasks", json={"text": "a"}).status_code == 200
+    assert client.post("/tasks", json={"text": "b"}).status_code == 429
+
+
+# --- usage ------------------------------------------------------------------
+
+
+def write_usage(tasks_dir, entries) -> None:
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    with (tasks_dir / "usage.jsonl").open("a") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+
+def usage_entry(recorded_at: str, **kw) -> dict:
+    return {"task_id": "20261104-100000-x", "recorded_at": recorded_at, "status": "done",
+            "subtype": "success", "duration_ms": 1000, "duration_api_ms": 900, "num_turns": 2,
+            "total_cost_usd": 0.5, "usage": {"input_tokens": 10, "output_tokens": 4,
+            "service_tier": "standard", "server_tool_use": {"web_search_requests": 0}},
+            "model_usage": None, **kw}
+
+
+def test_usage_empty(client) -> None:
+    body = client.get("/usage").json()
+    assert body["today"] == {"sessions": 0, "duration_ms": 0, "num_turns": 0,
+                             "total_cost_usd": 0, "usage": {}}
+    assert body["daily_task_cap"] == config.DAILY_TASK_CAP
+    assert body["tasks_created_today"] == 0
+
+
+def test_usage_totals_today_and_month(client, tasks_dir) -> None:
+    from datetime import datetime, timedelta
+    now = datetime.now().astimezone()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_month = month_start - timedelta(days=1)
+    other_day = now - timedelta(days=1) if now.day > 1 else None
+    entries = [usage_entry(now.isoformat()), usage_entry(now.isoformat(), num_turns=5,
+               total_cost_usd=None, usage={"input_tokens": 1})]
+    entries.append(usage_entry(last_month.isoformat(), duration_ms=99999))
+    if other_day:
+        entries.append(usage_entry(other_day.isoformat(), duration_ms=500))
+    write_usage(tasks_dir, entries)
+    body = client.get("/usage").json()
+    assert body["today"] == {"sessions": 2, "duration_ms": 2000, "num_turns": 7,
+                             "total_cost_usd": 0.5,
+                             "usage": {"input_tokens": 11, "output_tokens": 4}}
+    month = body["month"]
+    assert month["sessions"] == (3 if other_day else 2)
+    assert month["duration_ms"] == (2500 if other_day else 2000)
+
+
+def test_usage_matches_runner_log(client, real_runner, fake_sdk, tasks_dir) -> None:
+    """End to end: a task run (fake SDK) appends to usage.jsonl, /usage sums it."""
+    from claude_agent_sdk import ResultMessage
+
+    async def session(prompt, options, client):
+        yield ResultMessage(subtype="success", duration_ms=1500, duration_api_ms=1400,
+                            is_error=False, num_turns=4, session_id="s", total_cost_usd=0.03,
+                            usage={"input_tokens": 20, "output_tokens": 8}, result="ok")
+
+    fake_sdk(session)
+    for text in ("a", "b"):
+        task_id = client.post("/tasks", json={"text": text}).json()["task_id"]
+        wait_until(lambda: status_of(client, task_id) == "done")
+    lines = [json.loads(l) for l in (tasks_dir / "usage.jsonl").read_text().splitlines()]
+    today = client.get("/usage").json()["today"]
+    assert today["sessions"] == len(lines) == 2
+    assert today["duration_ms"] == sum(l["duration_ms"] for l in lines) == 3000
+    assert today["num_turns"] == 8
+    assert today["total_cost_usd"] == pytest.approx(0.06)
+    assert today["usage"] == {"input_tokens": 40, "output_tokens": 16}
+
+
+# --- startup ----------------------------------------------------------------
+
+
+def test_startup_refuses_with_api_key(tasks_dir, monkeypatch) -> None:
+    monkeypatch.setitem(os.environ, "ANTHROPIC_API_KEY", "x")
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY is set"):
+        with TestClient(main.app):
+            pass
+
+
+def test_startup_error_does_not_print_the_key(tasks_dir, monkeypatch) -> None:
+    monkeypatch.setitem(os.environ, "ANTHROPIC_API_KEY", "sk-should-never-appear")
+    with pytest.raises(RuntimeError) as info:
+        with TestClient(main.app):
+            pass
+    assert "sk-should-never-appear" not in str(info.value)
+
+
+# --- traversal: every endpoint that takes a task_id or path ----------------
+
+BAD_TASK_IDS = [
+    "..",
+    "%2E%2E",
+    "..%2F..%2Fetc",
+    "%2E%2E%2F%2E%2E%2Fetc",
+    "20261103-211400-x%2F..%2F..",
+    "%2Fetc%2Fpasswd",
+    "~",
+    "spike-20261103-184208",
+    "20261103-211400-A",
+    "20261103-211400-x%00",
+]
+
+ENDPOINTS = [
+    ("GET", "/tasks/{id}"),
+    ("GET", "/tasks/{id}/events"),
+    ("GET", "/tasks/{id}/files"),
+    ("GET", "/tasks/{id}/files/output/plan.md"),
+    ("POST", "/tasks/{id}/cancel"),
+]
+
+
+@pytest.mark.parametrize("method,template", ENDPOINTS)
+@pytest.mark.parametrize("bad", BAD_TASK_IDS)
+def test_bad_task_id_rejected_everywhere(client, method, template, bad) -> None:
+    response = client.request(method, template.format(id=bad))
+    assert response.status_code in (400, 404)
+
+
+@pytest.mark.parametrize("bad", BAD_TASK_IDS)
+def test_ws_bad_task_id_rejected(client, bad) -> None:
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f"/ws/tasks/{bad}") as ws:
+            ws.receive_json()
+
+
+@pytest.fixture
+def symlinked_task(client, tasks_dir, tmp_path):
+    """A dir outside TASKS_DIR that looks like a task, linked in under a valid id."""
+    outside = tmp_path / "outside"
+    (outside / "output").mkdir(parents=True)
+    (outside / "manifest.json").write_text(json.dumps({"task_id": "x", "status": "done"}))
+    (outside / "output" / "plan.md").write_text("TOP SECRET")
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    link = tasks_dir / "20261103-211400-linked"
+    link.symlink_to(outside, target_is_directory=True)
+    return link.name
+
+
+@pytest.mark.parametrize("method,template", ENDPOINTS)
+def test_symlinked_task_dir_is_404(client, symlinked_task, method, template) -> None:
+    response = client.request(method, template.format(id=symlinked_task))
+    assert response.status_code == 404
+    assert "TOP SECRET" not in response.text
+
+
+def test_ws_symlinked_task_dir_rejected(client, symlinked_task) -> None:
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f"/ws/tasks/{symlinked_task}") as ws:
             ws.receive_json()

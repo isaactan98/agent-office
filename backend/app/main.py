@@ -1,5 +1,8 @@
 import asyncio
+import logging
 import os
+from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -8,9 +11,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from app import config, events, runner, tasks
+from app import config, events, runner, tasks, usage
 
-app = FastAPI(title="agent-office")
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config.check_no_api_key()  # raising here stops uvicorn before it serves anything
+    yield
+
+
+app = FastAPI(title="agent-office", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[config.FRONTEND_ORIGIN],
@@ -24,7 +36,14 @@ TERMINAL_EVENTS = {"task_done", "task_failed"}
 # How often the WebSocket re-checks whether its task is still running.
 WS_POLL_SECONDS = 1.0
 
-# The one task currently running, if any. One task at a time.
+# How long POST /tasks/{id}/cancel waits for a running task to stop before it
+# cancels the asyncio task instead.
+CANCEL_WAIT_SECONDS = 15.0
+
+# One task runs at a time; the rest wait in _pending (FIFO). _worker runs them in
+# order; _running is the run_task of the current one, named after its task_id.
+_pending: deque[str] = deque()
+_worker: asyncio.Task | None = None
 _running: asyncio.Task | None = None
 
 
@@ -41,6 +60,23 @@ def _is_running(task_id: str) -> bool:
     return _is_busy() and _running.get_name() == task_id
 
 
+def _is_active(task_id: str) -> bool:
+    """True if task_id is running or waiting in the queue of this process."""
+    return _is_running(task_id) or task_id in _pending
+
+
+async def _work() -> None:
+    """Run queued tasks one after another until the queue is empty."""
+    global _running
+    while _pending:
+        task_id = _pending.popleft()
+        _running = asyncio.create_task(runner.run_task(task_id), name=task_id)
+        # wait() does not raise if run_task fails or is cancelled; the next task runs.
+        await asyncio.wait([_running])
+        if not _running.cancelled() and _running.exception() is not None:
+            log.error("run_task %s raised", task_id, exc_info=_running.exception())
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -48,13 +84,29 @@ def health() -> dict[str, str]:
 
 @app.post("/tasks")
 async def create_task(body: TaskIn) -> dict[str, str]:
-    global _running
-    if _is_busy():
-        raise HTTPException(status_code=409, detail="a task is already running")
+    """Create a task with status 'queued'. It runs when the tasks before it are done."""
+    global _worker
+    if tasks.count_created_today() >= config.DAILY_TASK_CAP:
+        raise HTTPException(
+            status_code=429,
+            detail=f"daily task cap reached ({config.DAILY_TASK_CAP} tasks today). "
+            "Try again tomorrow or raise DAILY_TASK_CAP.",
+        )
     manifest = tasks.create_task(body.text)
-    # Named after the task so _is_running() can tell which task it is.
-    _running = asyncio.create_task(runner.run_task(manifest["task_id"]), name=manifest["task_id"])
+    _pending.append(manifest["task_id"])
+    if _worker is None or _worker.done():
+        _worker = asyncio.create_task(_work())
     return {"task_id": manifest["task_id"], "status": manifest["status"]}
+
+
+@app.get("/usage")
+def get_usage() -> dict[str, Any]:
+    """SDK usage totals for today and this month, from TASKS_DIR/usage.jsonl."""
+    return {
+        **usage.summary(),
+        "daily_task_cap": config.DAILY_TASK_CAP,
+        "tasks_created_today": tasks.count_created_today(),
+    }
 
 
 @app.get("/tasks")
@@ -68,7 +120,8 @@ def _existing_task_dir(task_id: str) -> Path:
         directory = tasks.task_dir(task_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid task_id")
-    if not (directory / "manifest.json").is_file():
+    # A symlinked task dir could point anywhere; task dirs are always real dirs.
+    if directory.is_symlink() or not (directory / "manifest.json").is_file():
         raise HTTPException(status_code=404, detail="task not found")
     return directory
 
@@ -77,6 +130,33 @@ def _existing_task_dir(task_id: str) -> Path:
 def get_task(task_id: str) -> dict[str, Any]:
     _existing_task_dir(task_id)
     return tasks.read_manifest(task_id)
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str) -> dict[str, str]:
+    """Cancel a queued or running task. Answers once it is 'cancelled'."""
+    _existing_task_dir(task_id)
+    if _is_running(task_id):
+        current = _running
+        try:
+            # Ask the SDK session to stop; run_task then marks the task cancelled.
+            await asyncio.wait_for(runner.request_cancel(task_id), CANCEL_WAIT_SECONDS)
+            await asyncio.wait([current], timeout=CANCEL_WAIT_SECONDS)
+        except Exception:
+            log.exception("interrupt failed for %s", task_id)
+        if not current.done():  # the session did not stop: cancel the asyncio task
+            current.cancel()
+            await asyncio.wait([current])
+        if tasks.read_manifest(task_id)["status"] == "queued":  # cancelled before it began
+            runner.cancel_queued(task_id)
+    elif tasks.read_manifest(task_id)["status"] == "queued":
+        if task_id in _pending:
+            _pending.remove(task_id)
+        runner.cancel_queued(task_id)
+    else:
+        raise HTTPException(status_code=409, detail="task is not queued or running")
+    manifest = tasks.read_manifest(task_id)
+    return {"task_id": task_id, "status": manifest["status"]}
 
 
 @app.get("/tasks/{task_id}/events")
@@ -126,7 +206,8 @@ def get_task_file(task_id: str, file_path: str) -> str:
 @app.websocket("/ws/tasks/{task_id}")
 async def task_events_ws(websocket: WebSocket, task_id: str) -> None:
     """Send the task's past events, then new ones as they happen. Closes after
-    task_done/task_failed, or once the task is not running and nothing is left."""
+    task_done/task_failed, or once the task is neither running nor queued and
+    nothing is left."""
     # Browsers do not apply CORS to WebSockets, so check the origin here.
     # No Origin header means a non-browser client (curl, tests): allowed.
     origin = websocket.headers.get("origin")
@@ -155,7 +236,7 @@ async def task_events_ws(websocket: WebSocket, task_id: str) -> None:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=WS_POLL_SECONDS)
             except asyncio.TimeoutError:
-                if not _is_running(task_id) and queue.empty():
+                if not _is_active(task_id) and queue.empty():
                     break  # nothing more will be emitted for this task
                 continue
             if event.seq <= last_seq:

@@ -15,8 +15,8 @@ TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 # Allowed status changes. Anything else is a bug and raises.
 TRANSITIONS = {
-    "queued": {"running"},
-    "running": {"done", "failed"},
+    "queued": {"running", "cancelled"},
+    "running": {"done", "failed", "cancelled"},
 }
 
 
@@ -98,6 +98,18 @@ def record_agent_run(task_id: str, agent: str) -> dict[str, Any]:
     manifest["agents"][agent] = manifest["agents"].get(agent, 0) + 1
     _write_manifest(task_dir(task_id), manifest)
     return manifest
+
+
+def count_created_today() -> int:
+    """Tasks created today (local date, as in the task_id). A task cancelled before
+    it started does not count: it never used the subscription."""
+    prefix = f"{datetime.now():%Y%m%d}-"
+    return sum(
+        1
+        for m in list_manifests()
+        if m["task_id"].startswith(prefix)
+        and not (m["status"] == "cancelled" and m["started_at"] is None)
+    )
 
 
 def list_manifests() -> list[dict[str, Any]]:
