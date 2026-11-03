@@ -66,3 +66,4 @@ Fill these in as they are created:
 - Backend dev: `cd backend && uv run uvicorn app.main:app --host 127.0.0.1 --port 8000`
 - Backend tests: `cd backend && uv run pytest`
 - Frontend dev: `cd frontend && npm run dev`
+- Frontend tests: `cd frontend && npm test`

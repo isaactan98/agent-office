@@ -3,11 +3,67 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 5 done
+- Phase: 6 done
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `uv run pytest` → 152 passed; `npm run build` → build complete.
+- Blockers: none. `uv run pytest` → 152 passed; `npm test` → 20 passed;
+  `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-04 — SG — M3 MacBook Air (session 7)
+- Done: Phase 6 2D office. `frontend/app/utils/officeState.ts`: pure
+  `reduce(state, event)` + `tick(state, nowMs)`; time comes only from event
+  `ts` (or the `nowMs` passed in). Per character: `idle | walking | working
+  | talking` (derived by `characterStatus`), red "!" for 3 s after
+  `tool_denied`, bubble = first 40 chars of `summary` for 3 s, walks take
+  2 s (door ↔ desk). `subagent_start` → walk door → desk; `subagent_stop`
+  → walk desk → door, then leaves the room (not drawn). Orchestrator is
+  always in the room. Unknown agents → spare desk 1–3, then meeting table
+  seats; unknown event types → same state object returned. `task_done`/
+  `task_failed` reset open tools. `frontend/app/components/Office.vue`:
+  plain Canvas 2D (3 named desks, 3 spare, meeting table, door), original
+  simple shapes in the feed's agent colours; live mode reduces the feed
+  array (scene clock = `Date.now()` + max offset from event `ts`); replay
+  (done/failed tasks only) fetches `GET /tasks/{id}/events` and plays it
+  with original relative timing, 1×/4×, pause, restart, back to live.
+  Placed above the feed in `app.vue` (`:key` = task id). Reducer tests in
+  `frontend/tests/officeState.test.ts` with Node's built-in runner
+  (`npm test` → `node --test 'tests/*.test.ts'`, Node 24 strips types; no
+  new dependency). Committed as 4f8cb0d (not pushed).
+- Verified by: `npm test` → 20 passed, 0 failed (all 10 PLAN.md types,
+  unknown type, unknown agents, bad/missing `ts`, no mutation via deep
+  freeze). `npm run build` → build complete. `uv run pytest` → 152 passed.
+  `git diff -- backend docs` empty before the Phase 6 commit. Reducer replay of
+  `20261103-231235-write-output-route-md-a-short` (scratch script, 50 ms
+  samples): orchestrator idle → working (+8.2s) → idle → working → idle →
+  working → idle → working → idle → talking (+119.0s) → idle; writer
+  walking (+8.3s) → idle → working → idle → walking (+31.6s) → away →
+  walking (+81.5s) → working → idle → working → idle → walking → away;
+  reviewer walking (+35.6s) → idle → working → idle → working → idle →
+  working → idle → walking (+74.5s) → away. In-app browser, real backend
+  (`env -i`, 127.0.0.1:8000): replay of that task showed reviewer walking,
+  writer idle at desk, orchestrator working, ended at 31/31 with only the
+  orchestrator. Live mode: a throwaway fake backend in the scratchpad (not
+  in the repo, no agent run) streamed the same events at 4× with fresh
+  `ts`; office matched the feed (writer walks in on `subagent_start`,
+  walks out on the orchestrator's `tool_end Agent`, bubble on
+  `agent_message`). A second fake stream with an injected `tool_denied`,
+  unknown agent `researcher` and unknown type showed the red "!", a spare
+  desk, and no errors.
+- Notes: tools finish in ~15 ms, so a character keeps "working" for at
+  least 1.5 s after `tool_start` (`MIN_WORK_MS`), else it is never visible.
+  Prompt paths `frontend/components/`, `frontend/utils/` moved under
+  `frontend/app/` (Nuxt 4 srcDir). The browser pane ran at ~2 fps (hidden/
+  throttled), so the writer walking/typing in replay was not seen on
+  screen (reducer output only); smoothness unverified. Replay frame step
+  clamp raised from 100 ms to 1 s after replay crawled at 2 fps. A real
+  live task with the office: unverified (no run spent).
+- Next: Phase 7 (`prompts/07-hardening.md`) in a new session.
+- Open questions: keep Node's built-in test runner, or switch to vitest?
+  (Still open: manifest `agents` shape in PLAN.md; `FRONTEND_ORIGIN` in
+  `.env.example`; `tool` may be `null` in PLAN.md; pin a cheaper default
+  model; spend a run on a live hook deny; claude.ai login terms;
+  `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-03 — SG — M3 MacBook Air (session 6)
 - Done: Phase 5 orchestrator + subagents. New `app/agents.py`: orchestrator
