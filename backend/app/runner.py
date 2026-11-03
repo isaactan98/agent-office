@@ -3,13 +3,23 @@
 SDK option names were verified in Phase 1 (backend/spikes/README.md).
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    HookMatcher,
+    ResultMessage,
+    TextBlock,
+    query,
+)
 
-from app import tasks
+from app import events, tasks
+
+log = logging.getLogger(__name__)
 
 # File read/write/edit/search only. No Bash, no web tools.
 TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
@@ -80,13 +90,75 @@ def check_tool_call(tool_name: str, tool_input: dict[str, Any], task_dir: Path) 
     return f"tool {tool_name!r} is not allowed"
 
 
-def make_path_guard(task_dir: Path):
-    """PreToolUse hook that denies tool calls touching paths outside task_dir."""
+def tool_target(tool_name: str, tool_input: dict[str, Any], task_dir: Path) -> tuple[str | None, str]:
+    """(path relative to task_dir or None, short label for the summary) of a tool call."""
+    if tool_name in ("Read", "Write", "Edit"):
+        raw = tool_input.get("file_path")
+        path = events.relative_path(raw, task_dir)
+        return path, path or str(raw)
+    if tool_name in ("Glob", "Grep"):
+        path = events.relative_path(tool_input.get("path"), task_dir)
+        pattern = repr(tool_input.get("pattern"))  # Glob: file pattern, Grep: regex
+        return path, f"{pattern} in {path}" if path else pattern
+    return None, ""
+
+
+def agent_fields(input_data: dict[str, Any]) -> dict[str, Any]:
+    """agent/agent_id from a tool hook input. The installed SDK sets agent_id and
+    agent_type on tool hooks only when they fire inside a subagent."""
+    return {
+        "agent": input_data.get("agent_type") or events.DEFAULT_AGENT,
+        "agent_id": input_data.get("agent_id"),
+    }
+
+
+def emit_safely(emitter: events.EventEmitter, type: str, summary: str, **fields: Any) -> None:
+    """Emit, but never raise: a broken event log must not break the task or a hook."""
+    try:
+        emitter.emit(type, summary, **fields)
+    except Exception:
+        log.exception("could not emit %s event", type)
+
+
+def emit_tool_event(
+    emitter: events.EventEmitter,
+    task_dir: Path,
+    type: str,
+    input_data: dict[str, Any],
+    reason: str | None = None,
+) -> None:
+    """Emit tool_start / tool_end / tool_denied from hook input. Never raises."""
+    try:
+        tool = input_data.get("tool_name")
+        path, label = tool_target(tool, input_data.get("tool_input") or {}, task_dir)
+        if type == "tool_denied":
+            summary = f"Denied {reason}"
+        elif type == "tool_end":
+            failed = input_data.get("hook_event_name") == "PostToolUseFailure"
+            summary = f"{tool} {'failed' if failed else 'done'}: {label}"
+        else:
+            summary = f"{tool} {label}"
+        emitter.emit(type, summary, tool=tool, path=path, **agent_fields(input_data))
+    except Exception:
+        log.exception("could not emit %s event", type)
+
+
+def make_path_guard(task_dir: Path, emitter: events.EventEmitter):
+    """PreToolUse hook that denies tool calls touching paths outside task_dir.
+
+    Emits tool_start for allowed calls and tool_denied for denied ones.
+    """
 
     async def path_guard(input_data, tool_use_id, context):
-        reason = check_tool_call(input_data["tool_name"], input_data["tool_input"], task_dir)
+        try:
+            reason = check_tool_call(input_data["tool_name"], input_data["tool_input"], task_dir)
+        except Exception:
+            log.exception("path guard failed; denying the call")
+            reason = "path guard error"
         if reason is None:
+            emit_tool_event(emitter, task_dir, "tool_start", input_data)
             return {}
+        emit_tool_event(emitter, task_dir, "tool_denied", input_data, reason)
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -98,7 +170,18 @@ def make_path_guard(task_dir: Path):
     return path_guard
 
 
-def build_options(task_dir: Path) -> ClaudeAgentOptions:
+def make_tool_end_hook(task_dir: Path, emitter: events.EventEmitter):
+    """PostToolUse / PostToolUseFailure hook that emits tool_end. Never decides anything."""
+
+    async def tool_end(input_data, tool_use_id, context):
+        emit_tool_event(emitter, task_dir, "tool_end", input_data)
+        return {}
+
+    return tool_end
+
+
+def build_options(task_dir: Path, emitter: events.EventEmitter) -> ClaudeAgentOptions:
+    tool_end = make_tool_end_hook(task_dir, emitter)
     return ClaudeAgentOptions(
         cwd=task_dir,
         tools=TOOLS,  # the only built-in tools that exist in the session
@@ -111,16 +194,25 @@ def build_options(task_dir: Path) -> ClaudeAgentOptions:
         hooks={
             # matcher=None: every tool call. on_failure="block": a crashing hook denies.
             "PreToolUse": [
-                HookMatcher(matcher=None, hooks=[make_path_guard(task_dir)], on_failure="block")
-            ]
+                HookMatcher(
+                    matcher=None, hooks=[make_path_guard(task_dir, emitter)], on_failure="block"
+                )
+            ],
+            "PostToolUse": [HookMatcher(matcher=None, hooks=[tool_end])],
+            "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[tool_end])],
         },
     )
 
 
 async def run_task(task_id: str) -> None:
-    """Run the task. Ends with status 'done' (summary.md written) or 'failed'."""
+    """Run the task. Ends with status 'done' (summary.md written) or 'failed'.
+
+    Events go to events.jsonl: task_started first, task_done or task_failed last.
+    """
     task_dir = tasks.task_dir(task_id)
+    emitter = events.EventEmitter(task_id, task_dir)
     manifest = tasks.set_status(task_id, "running")
+    emit_safely(emitter, "task_started", "Task started")
     try:
         # Check presence only; never read or print the value.
         if "ANTHROPIC_API_KEY" in os.environ:
@@ -128,8 +220,12 @@ async def run_task(task_id: str) -> None:
 
         result: ResultMessage | None = None
         prompt = PROMPT_TEMPLATE.format(text=manifest["text"])
-        async for message in query(prompt=prompt, options=build_options(task_dir)):
-            if isinstance(message, ResultMessage):
+        async for message in query(prompt=prompt, options=build_options(task_dir, emitter)):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        emit_safely(emitter, "agent_message", block.text)
+            elif isinstance(message, ResultMessage):
                 result = message
 
         if result is None:
@@ -139,5 +235,8 @@ async def run_task(task_id: str) -> None:
 
         (task_dir / "summary.md").write_text((result.result or "") + "\n")
         tasks.set_status(task_id, "done")
+        emit_safely(emitter, "task_done", f"Task done in {result.num_turns} turns")
     except Exception as exc:
-        tasks.set_status(task_id, "failed", error=f"{type(exc).__name__}: {exc}")
+        error = f"{type(exc).__name__}: {exc}"
+        tasks.set_status(task_id, "failed", error=error)
+        emit_safely(emitter, "task_failed", f"Task failed: {error}")

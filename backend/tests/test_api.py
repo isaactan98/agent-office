@@ -3,7 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app import main, runner, tasks
+from app import events, main, runner, tasks
 
 
 @pytest.fixture
@@ -59,3 +59,19 @@ def test_get_task_invalid_format_is_400(client) -> None:
 
 def test_get_task_missing_is_404(client) -> None:
     assert client.get("/tasks/20261103-211400-missing").status_code == 404
+
+
+def test_get_events(client, tasks_dir) -> None:
+    task_id = client.post("/tasks", json={"text": "one"}).json()["task_id"]
+    assert client.get(f"/tasks/{task_id}/events").json() == []
+    emitter = events.EventEmitter(task_id, tasks_dir / task_id)
+    emitter.emit("task_started", "Task started")
+    emitter.emit("task_done", "Task done")
+    body = client.get(f"/tasks/{task_id}/events").json()
+    assert [e["seq"] for e in body] == [1, 2]
+    assert [e["type"] for e in body] == ["task_started", "task_done"]
+
+
+def test_get_events_bad_or_missing_task(client) -> None:
+    assert client.get("/tasks/not-a-task/events").status_code == 400
+    assert client.get("/tasks/20261103-211400-missing/events").status_code == 404

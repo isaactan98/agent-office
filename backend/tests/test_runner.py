@@ -1,12 +1,13 @@
 """Path guard and run_task tests. The real SDK is never called."""
 
 import asyncio
+import json
 import os
 
 import pytest
-from claude_agent_sdk import ResultMessage
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from app import runner, tasks
+from app import events, runner, tasks
 
 
 @pytest.fixture
@@ -14,6 +15,15 @@ def task_dir(tmp_path):
     directory = tmp_path / "task"
     (directory / "output").mkdir(parents=True)
     return directory.resolve()
+
+
+@pytest.fixture
+def emitter(task_dir):
+    return events.EventEmitter("20261103-211400-test", task_dir)
+
+
+def logged(task_dir) -> list[dict]:
+    return events.read_events(task_dir)
 
 
 # --- is_path_inside -------------------------------------------------------
@@ -122,8 +132,8 @@ def test_unknown_tools_denied(task_dir, tool) -> None:
     assert runner.check_tool_call(tool, {"command": "ls"}, task_dir) is not None
 
 
-def test_path_guard_hook_output(task_dir) -> None:
-    guard = runner.make_path_guard(task_dir)
+def test_path_guard_hook_output(task_dir, emitter) -> None:
+    guard = runner.make_path_guard(task_dir, emitter)
     allow = asyncio.run(guard(
         {"tool_name": "Write", "tool_input": {"file_path": "output/a.md"}}, "id1", {"signal": None}
     ))
@@ -135,14 +145,97 @@ def test_path_guard_hook_output(task_dir) -> None:
     assert out["hookEventName"] == "PreToolUse" and out["permissionDecision"] == "deny"
 
 
-def test_build_options_isolation(task_dir) -> None:
-    options = runner.build_options(task_dir)
+def test_build_options_isolation(task_dir, emitter) -> None:
+    options = runner.build_options(task_dir, emitter)
     assert options.tools == ["Read", "Write", "Edit", "Glob", "Grep"]
     assert options.setting_sources == []
     assert options.strict_mcp_config is True
     assert options.permission_mode == "dontAsk"
     assert options.cwd == task_dir
     assert options.hooks["PreToolUse"][0].on_failure == "block"
+    assert set(options.hooks) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+
+
+# --- tool hooks emit events (synthetic hook inputs) -------------------------
+
+
+def hook_input(event: str, tool: str, tool_input: dict, **extra) -> dict:
+    return {"hook_event_name": event, "session_id": "s", "transcript_path": "/t", "cwd": "/c",
+            "tool_name": tool, "tool_input": tool_input, "tool_use_id": "tu1", **extra}
+
+
+def test_guard_allow_emits_tool_start(task_dir, emitter) -> None:
+    guard = runner.make_path_guard(task_dir, emitter)
+    data = hook_input("PreToolUse", "Write", {"file_path": str(task_dir / "output/a.md"), "content": "SECRET"})
+    assert asyncio.run(guard(data, "tu1", {"signal": None})) == {}
+    [event] = logged(task_dir)
+    assert event["type"] == "tool_start" and event["tool"] == "Write"
+    assert event["path"] == "output/a.md"
+    assert event["agent"] == "orchestrator" and event["agent_id"] is None
+    assert "SECRET" not in json.dumps(event)  # never file contents
+
+
+def test_guard_deny_emits_tool_denied(task_dir, emitter) -> None:
+    guard = runner.make_path_guard(task_dir, emitter)
+    data = hook_input("PreToolUse", "Read", {"file_path": "/etc/passwd"})
+    out = asyncio.run(guard(data, "tu1", {"signal": None}))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    [event] = logged(task_dir)
+    assert event["type"] == "tool_denied" and event["path"] is None
+    assert "outside the task directory" in event["summary"]
+
+
+def test_guard_bad_input_denies_without_raising(task_dir, emitter) -> None:
+    guard = runner.make_path_guard(task_dir, emitter)
+    out = asyncio.run(guard({"tool_name": "Write"}, "tu1", {"signal": None}))  # no tool_input
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert logged(task_dir)[0]["type"] == "tool_denied"
+
+
+def test_guard_still_decides_when_emit_fails(task_dir, emitter, monkeypatch) -> None:
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(emitter, "emit", broken)
+    guard = runner.make_path_guard(task_dir, emitter)
+    allow = hook_input("PreToolUse", "Write", {"file_path": "output/a.md"})
+    deny = hook_input("PreToolUse", "Write", {"file_path": "/tmp/a.md"})
+    assert asyncio.run(guard(allow, "tu1", {"signal": None})) == {}
+    assert "hookSpecificOutput" in asyncio.run(guard(deny, "tu2", {"signal": None}))
+
+
+def test_subagent_fields_from_hook_input(task_dir, emitter) -> None:
+    guard = runner.make_path_guard(task_dir, emitter)
+    data = hook_input("PreToolUse", "Read", {"file_path": "output/a.md"},
+                      agent_id="agent-7", agent_type="writer")
+    asyncio.run(guard(data, "tu1", {"signal": None}))
+    [event] = logged(task_dir)
+    assert event["agent"] == "writer" and event["agent_id"] == "agent-7"
+
+
+def test_tool_end_hook(task_dir, emitter) -> None:
+    hook = runner.make_tool_end_hook(task_dir, emitter)
+    done = hook_input("PostToolUse", "Write", {"file_path": "output/a.md"}, tool_response={"x": "SECRET"})
+    failed = hook_input("PostToolUseFailure", "Read", {"file_path": "output/b.md"}, error="SECRET")
+    assert asyncio.run(hook(done, "tu1", {"signal": None})) == {}
+    assert asyncio.run(hook(failed, "tu2", {"signal": None})) == {}
+    first, second = logged(task_dir)
+    assert first["type"] == second["type"] == "tool_end"
+    assert first["summary"] == "Write done: output/a.md"
+    assert second["summary"] == "Read failed: output/b.md"
+    assert "SECRET" not in json.dumps([first, second])
+
+
+def test_tool_end_hook_never_raises(task_dir, emitter) -> None:
+    hook = runner.make_tool_end_hook(task_dir, emitter)
+    assert asyncio.run(hook({}, None, {"signal": None})) == {}
+    assert asyncio.run(hook(None, None, {"signal": None})) == {}
+
+
+def test_glob_grep_summary(task_dir) -> None:
+    assert runner.tool_target("Glob", {"pattern": "**/*.md"}, task_dir) == (None, "'**/*.md'")
+    assert runner.tool_target("Grep", {"pattern": "x", "path": str(task_dir / "output")}, task_dir) == (
+        "output", "'x' in output")
 
 
 # --- run_task with a fake SDK ---------------------------------------------
@@ -175,6 +268,33 @@ def test_run_task_done_writes_summary(tasks_dir, monkeypatch, no_api_key) -> Non
     manifest = tasks.read_manifest(task_id)
     assert manifest["status"] == "done"
     assert (tasks_dir / task_id / "summary.md").read_text() == "Wrote output/hello.md\n"
+    assert [e["type"] for e in logged(tasks_dir / task_id)] == ["task_started", "task_done"]
+
+
+def test_run_task_event_sequence(tasks_dir, monkeypatch, no_api_key) -> None:
+    """A fake session that calls the registered hooks the way the CLI would."""
+
+    async def _query(prompt, options):
+        pre = options.hooks["PreToolUse"][0].hooks[0]
+        post = options.hooks["PostToolUse"][0].hooks[0]
+        write = {"file_path": "output/hello.md", "content": "hi"}
+        yield AssistantMessage(content=[TextBlock(text="I will write\nthe file. " + "x" * 200)], model="m")
+        await pre(hook_input("PreToolUse", "Write", write), "tu1", {"signal": None})
+        await post(hook_input("PostToolUse", "Write", write, tool_response={}), "tu1", {"signal": None})
+        await pre(hook_input("PreToolUse", "Write", {"file_path": "../x.md"}), "tu2", {"signal": None})
+        yield fake_result()
+
+    monkeypatch.setattr(runner, "query", _query)
+    task_id = tasks.create_task("hello")["task_id"]
+    asyncio.run(runner.run_task(task_id))
+    file = tasks_dir / task_id / "events.jsonl"
+    checked = events.validate_file(file)
+    assert [e.type for e in checked] == [
+        "task_started", "agent_message", "tool_start", "tool_end", "tool_denied", "task_done"]
+    assert [e.seq for e in checked] == [1, 2, 3, 4, 5, 6]
+    message = checked[1]
+    assert message.summary.startswith("I will write the file.") and len(message.summary) == 120
+    assert {e.task_id for e in checked} == {task_id}
 
 
 def test_run_task_exception_marks_failed(tasks_dir, monkeypatch, no_api_key) -> None:
@@ -185,6 +305,8 @@ def test_run_task_exception_marks_failed(tasks_dir, monkeypatch, no_api_key) -> 
     assert manifest["status"] == "failed"
     assert "cli died" in manifest["error"]
     assert not (tasks_dir / task_id / "summary.md").exists()
+    types = [e["type"] for e in logged(tasks_dir / task_id)]
+    assert types == ["task_started", "task_failed"]
 
 
 def test_run_task_error_result_marks_failed(tasks_dir, monkeypatch, no_api_key) -> None:
