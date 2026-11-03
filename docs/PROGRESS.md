@@ -3,11 +3,60 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 3 done
+- Phase: 4 done
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `uv run pytest` → 98 passed; `npm run build` → build complete.
+- Blockers: none. `uv run pytest` → 121 passed; `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-03 — SG — M3 MacBook Air (session 5)
+- Done: Phase 4 web UI. Backend (`app/main.py`): `WS /ws/tasks/{task_id}`
+  subscribes first, replays `events.jsonl`, then streams pub/sub events
+  (dedup by seq) and closes after `task_done`/`task_failed`, or once the
+  task is not running in this process (checked every 1 s; the asyncio task
+  is now named after the task_id). `GET /tasks/{id}/files` → sorted
+  `{path, size}` list via `os.walk` (symlinks resolving outside skipped).
+  `GET /tasks/{id}/files/{path}` → text/plain; same `is_path_inside` check
+  as the agent guard → 400 outside, 404 missing/dir, 413 ≥ 1 MiB, 415
+  NUL byte or not UTF-8. CORS: only `FRONTEND_ORIGIN` (new in
+  `app/config.py`, default `http://localhost:3000`). Not asked for in the
+  prompt, added because browsers don't apply CORS to WebSockets: the WS
+  closes (1008) on any `Origin` other than `FRONTEND_ORIGIN`; no Origin
+  (curl, tests) is allowed. Frontend (`app/app.vue`, plain Vue + CSS, no
+  new deps): chat box (disabled while a task is queued/running, shows the
+  reason; POST errors shown as "409: …"), live feed (time/agent/type/
+  summary, colour per type, unknown types → grey generic row with raw
+  JSON, auto-scroll when near bottom), task sidebar with status badges,
+  file list + `<pre>` viewer; open task kept in `?task=` for reloads;
+  `runtimeConfig.public.apiBase` default `http://127.0.0.1:8000`.
+  23 new tests in `test_api.py` (files, traversal, 413/415, CORS, WS
+  replay/live/stale/origin/bad id). Committed as 465f036 (not pushed).
+- Verified by: `uv run pytest` → 121 passed. `npm run build` → build
+  complete. `lsof` → backend 127.0.0.1:8000, Nuxt dev [::1]:3000 only;
+  backend started with `env -i`. `curl --path-as-is
+  /tasks/<id>/files/../../CLAUDE.md` → `400 {"detail":"path is outside the
+  task directory"}`; `%2F`-encoded and absolute forms → same 400. Browser
+  (in-app browser): finished task replayed with its files; 1 real run (of 2
+  allowed) with the Skudai cafes prompt → task
+  `20261103-222842-write-output-plan-md-listing-5`: `task_started` showed
+  live, Send disabled with reason; reload mid-task → reconnected
+  (`feed: live`), then seq 2–5 arrived live and the socket closed;
+  sidebar → `done`, `output/plan.md` (3.1 KB) opened in the viewer; no
+  console errors. `python -m app.events` → "OK: 5 events, seq strictly
+  increasing".
+- Notes: the reload happened when only 1 event existed, so the replay part
+  after reload was small (replay of a full finished task was seen
+  separately). Unknown-type rows and the 409 message in the UI were not
+  seen in the browser: unverified (409 itself is unit-tested). Opening the
+  UI at `127.0.0.1:3000` instead of `localhost:3000` will fail CORS
+  unless `FRONTEND_ORIGIN` is changed. A manifest left `running` after a
+  crash still disables Send in the UI (Phase 2 gap). No frontend tests or
+  typecheck (`vue-tsc` not installed).
+- Next: Phase 5 (`prompts/05-orchestrator.md`) in a new session.
+- Open questions: add `FRONTEND_ORIGIN` to `.env.example`? (Still open:
+  should PLAN.md state that `tool` may be `null`; pin a cheaper default
+  model; spend a run on a live hook deny; claude.ai login terms;
+  `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-03 — SG — M3 MacBook Air (session 4)
 - Done: Phase 3 events. `app/events.py`: `Event` pydantic model with the
