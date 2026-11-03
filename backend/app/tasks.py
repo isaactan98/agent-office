@@ -62,7 +62,7 @@ def create_task(text: str) -> dict[str, Any]:
         "task_id": task_id,
         "text": text,
         "status": "queued",
-        "agents": ["orchestrator"],
+        "agents": {},  # agent name -> number of runs, filled in while the task runs
         "created_at": now_iso(),
         "started_at": None,
         "finished_at": None,
@@ -88,6 +88,14 @@ def set_status(task_id: str, status: str, error: str | None = None) -> dict[str,
         manifest["finished_at"] = now_iso()
     if error is not None:
         manifest["error"] = error
+    _write_manifest(task_dir(task_id), manifest)
+    return manifest
+
+
+def record_agent_run(task_id: str, agent: str) -> dict[str, Any]:
+    """Count one run of `agent` in the manifest's `agents` map."""
+    manifest = read_manifest(task_id)
+    manifest["agents"][agent] = manifest["agents"].get(agent, 0) + 1
     _write_manifest(task_dir(task_id), manifest)
     return manifest
 

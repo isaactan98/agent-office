@@ -1,6 +1,9 @@
-"""Run one task as a single Agent SDK session, sandboxed to its task directory.
+"""Run one task as an Agent SDK session (orchestrator + subagents from app/agents.py),
+sandboxed to its task directory.
 
-SDK option names were verified in Phase 1 (backend/spikes/README.md).
+SDK option names were verified in Phase 1 (backend/spikes/README.md). Subagent
+events come from the SDK's SubagentStart/SubagentStop hooks; tool hooks carry
+agent_id/agent_type when they fire inside a subagent.
 """
 
 import logging
@@ -17,12 +20,14 @@ from claude_agent_sdk import (
     query,
 )
 
-from app import events, tasks
+from app import agents, events, tasks
 
 log = logging.getLogger(__name__)
 
 # File read/write/edit/search only. No Bash, no web tools.
 TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
+# The orchestrator also gets the delegation tool, to start writer/reviewer.
+SESSION_TOOLS = TOOLS + [agents.DELEGATION_TOOL]
 MAX_TURNS = 20
 
 PROMPT_TEMPLATE = """\
@@ -70,13 +75,45 @@ def is_glob_inside(pattern: str, base: str, task_dir: Path) -> bool:
     return is_path_inside(str(Path(base).joinpath(*literal)), task_dir)
 
 
-def check_tool_call(tool_name: str, tool_input: dict[str, Any], task_dir: Path) -> str | None:
-    """Return a reason to deny the call, or None if every path stays inside task_dir."""
+def check_delegation(tool_input: dict[str, Any], agent_type: str | None, agent_calls: int) -> str | None:
+    """Return a reason to deny an Agent tool call, or None if it may start a subagent."""
+    if agent_type is not None:
+        return f"Agent: subagent {agent_type!r} may not start other agents"
+    extra = sorted(set(tool_input) - agents.DELEGATION_KEYS)
+    if extra:
+        return f"Agent: fields {extra} are not allowed"
+    name = tool_input.get("subagent_type")
+    if name not in agents.SUBAGENTS:
+        return f"Agent: unknown subagent {name!r}"
+    if tool_input.get("run_in_background") is not False:
+        return "Agent: run_in_background must be false"
+    if agent_calls >= agents.MAX_SUBAGENT_CALLS:
+        return f"Agent: limit of {agents.MAX_SUBAGENT_CALLS} subagent calls reached"
+    return None
+
+
+def check_tool_call(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    task_dir: Path,
+    agent_type: str | None = None,
+    agent_calls: int = 0,
+) -> str | None:
+    """Return a reason to deny the call, or None if it is allowed.
+
+    Every path must stay inside task_dir. `agent_type` is the subagent making the
+    call (None for the orchestrator); `agent_calls` is how many subagent calls were
+    already allowed in this task.
+    """
     root = str(task_dir.resolve())
     if tool_name in ("Read", "Write", "Edit"):
         path = tool_input.get("file_path")
         if not is_path_inside(path, task_dir):
             return f"{tool_name}: path {path!r} is outside the task directory"
+        # Not resolved: if review.md is a symlink, the resolved path differs and is denied.
+        review_file = task_dir.resolve() / agents.REVIEW_FILE
+        if agent_type == agents.REVIEWER and tool_name != "Read" and (task_dir / path).resolve() != review_file:
+            return f"{tool_name}: the reviewer may only write {agents.REVIEW_FILE}"
         return None
     if tool_name in ("Glob", "Grep"):
         base = tool_input.get("path") or root
@@ -86,6 +123,8 @@ def check_tool_call(tool_name: str, tool_input: dict[str, Any], task_dir: Path) 
         if pattern is not None and not is_glob_inside(pattern, base, task_dir):
             return f"{tool_name}: pattern {pattern!r} reaches outside the task directory"
         return None
+    if tool_name == agents.DELEGATION_TOOL:
+        return check_delegation(tool_input, agent_type, agent_calls)
     # Fail closed: a tool we do not know how to check is denied.
     return f"tool {tool_name!r} is not allowed"
 
@@ -100,6 +139,8 @@ def tool_target(tool_name: str, tool_input: dict[str, Any], task_dir: Path) -> t
         path = events.relative_path(tool_input.get("path"), task_dir)
         pattern = repr(tool_input.get("pattern"))  # Glob: file pattern, Grep: regex
         return path, f"{pattern} in {path}" if path else pattern
+    if tool_name == agents.DELEGATION_TOOL:
+        return None, f"{tool_input.get('subagent_type')}: {tool_input.get('description')}"
     return None, ""
 
 
@@ -146,16 +187,27 @@ def emit_tool_event(
 def make_path_guard(task_dir: Path, emitter: events.EventEmitter):
     """PreToolUse hook that denies tool calls touching paths outside task_dir.
 
-    Emits tool_start for allowed calls and tool_denied for denied ones.
+    Also enforces the per-agent rules in check_tool_call and counts allowed subagent
+    calls. Emits tool_start for allowed calls and tool_denied for denied ones.
     """
+    agent_calls = 0
 
     async def path_guard(input_data, tool_use_id, context):
+        nonlocal agent_calls
         try:
-            reason = check_tool_call(input_data["tool_name"], input_data["tool_input"], task_dir)
+            reason = check_tool_call(
+                input_data["tool_name"],
+                input_data["tool_input"],
+                task_dir,
+                agent_type=input_data.get("agent_type"),
+                agent_calls=agent_calls,
+            )
         except Exception:
             log.exception("path guard failed; denying the call")
             reason = "path guard error"
         if reason is None:
+            if input_data["tool_name"] == agents.DELEGATION_TOOL:
+                agent_calls += 1
             emit_tool_event(emitter, task_dir, "tool_start", input_data)
             return {}
         emit_tool_event(emitter, task_dir, "tool_denied", input_data, reason)
@@ -180,12 +232,37 @@ def make_tool_end_hook(task_dir: Path, emitter: events.EventEmitter):
     return tool_end
 
 
+def make_subagent_hook(emitter: events.EventEmitter):
+    """SubagentStart / SubagentStop hook: emits subagent_start / subagent_stop and
+    counts each start in the manifest. Never decides anything, never raises."""
+
+    async def subagent_hook(input_data, tool_use_id, context):
+        try:
+            name = input_data.get("agent_type") or "unknown"
+            fields = {"agent": name, "agent_id": input_data.get("agent_id")}
+            if input_data.get("hook_event_name") == "SubagentStart":
+                emit_safely(emitter, "subagent_start", f"{name} started", **fields)
+                tasks.record_agent_run(emitter.task_id, name)
+            else:
+                last = input_data.get("last_assistant_message")
+                summary = f"{name} finished: {last}" if last else f"{name} finished"
+                emit_safely(emitter, "subagent_stop", summary, **fields)
+        except Exception:
+            log.exception("subagent hook failed")
+        return {}
+
+    return subagent_hook
+
+
 def build_options(task_dir: Path, emitter: events.EventEmitter) -> ClaudeAgentOptions:
     tool_end = make_tool_end_hook(task_dir, emitter)
+    subagent_hook = make_subagent_hook(emitter)
     return ClaudeAgentOptions(
         cwd=task_dir,
-        tools=TOOLS,  # the only built-in tools that exist in the session
-        allowed_tools=TOOLS,  # auto-approve them
+        system_prompt=agents.ORCHESTRATOR_PROMPT,
+        agents=agents.SUBAGENTS,
+        tools=SESSION_TOOLS,  # the only built-in tools that exist in the session
+        allowed_tools=SESSION_TOOLS,  # auto-approve them
         permission_mode="dontAsk",  # anything not pre-approved is denied
         setting_sources=[],  # do not load ~/.claude or project settings/CLAUDE.md/hooks
         strict_mcp_config=True,  # no MCP servers, including claude.ai connectors
@@ -200,6 +277,8 @@ def build_options(task_dir: Path, emitter: events.EventEmitter) -> ClaudeAgentOp
             ],
             "PostToolUse": [HookMatcher(matcher=None, hooks=[tool_end])],
             "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[tool_end])],
+            "SubagentStart": [HookMatcher(matcher=None, hooks=[subagent_hook])],
+            "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_hook])],
         },
     )
 
@@ -217,11 +296,14 @@ async def run_task(task_id: str) -> None:
         # Check presence only; never read or print the value.
         if "ANTHROPIC_API_KEY" in os.environ:
             raise RuntimeError("ANTHROPIC_API_KEY is set in the environment. Refusing to run.")
+        tasks.record_agent_run(task_id, agents.ORCHESTRATOR)
 
         result: ResultMessage | None = None
         prompt = PROMPT_TEMPLATE.format(text=manifest["text"])
         async for message in query(prompt=prompt, options=build_options(task_dir, emitter)):
-            if isinstance(message, AssistantMessage):
+            # Subagent text is not forwarded (forward_subagent_text is off); messages
+            # with a parent_tool_use_id carry only a subagent's tool blocks.
+            if isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
                         emit_safely(emitter, "agent_message", block.text)
@@ -233,7 +315,9 @@ async def run_task(task_id: str) -> None:
         if result.is_error or result.subtype != "success":
             raise RuntimeError(f"SDK result {result.subtype!r}: {result.errors or result.result}")
 
-        (task_dir / "summary.md").write_text((result.result or "") + "\n")
+        summary = task_dir / "summary.md"
+        if not summary.exists():  # the orchestrator should have written it
+            summary.write_text((result.result or "") + "\n")
         tasks.set_status(task_id, "done")
         emit_safely(emitter, "task_done", f"Task done in {result.num_turns} turns")
     except Exception as exc:

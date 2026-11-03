@@ -40,6 +40,15 @@ def test_create_task_makes_dir_and_manifest(tasks_dir) -> None:
     assert manifest["status"] == "queued"
     assert manifest["text"] == "Write a haiku"
     assert manifest["started_at"] is None and manifest["error"] is None
+    assert manifest["agents"] == {}
+
+
+def test_record_agent_run_counts(tasks_dir) -> None:
+    task_id = tasks.create_task("x")["task_id"]
+    tasks.record_agent_run(task_id, "orchestrator")
+    tasks.record_agent_run(task_id, "writer")
+    tasks.record_agent_run(task_id, "writer")
+    assert tasks.read_manifest(task_id)["agents"] == {"orchestrator": 1, "writer": 2}
 
 
 def test_status_transitions_done(tasks_dir) -> None:

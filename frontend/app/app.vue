@@ -33,6 +33,8 @@ const KNOWN_TYPES = new Set([
   'tool_denied', 'subagent_start', 'subagent_stop', 'task_done', 'task_failed'
 ])
 const TERMINAL_TYPES = new Set(['task_done', 'task_failed'])
+// Agents defined in backend/app/agents.py. Any other name gets the grey tag.
+const AGENTS = ['orchestrator', 'writer', 'reviewer']
 
 const apiBase = useRuntimeConfig().public.apiBase as string
 const wsBase = apiBase.replace(/^http/, 'ws')
@@ -206,6 +208,10 @@ function eventClass(event: TaskEvent): string {
   return typeof event.type === 'string' && KNOWN_TYPES.has(event.type) ? `t-${event.type}` : 't-unknown'
 }
 
+function agentClass(event: TaskEvent): string {
+  return typeof event.agent === 'string' && AGENTS.includes(event.agent) ? `a-${event.agent}` : 'a-other'
+}
+
 function eventSummary(event: TaskEvent): string {
   return typeof event.summary === 'string' ? event.summary : JSON.stringify(event)
 }
@@ -281,6 +287,10 @@ onBeforeUnmount(() => {
         <p v-if="selectedTask" class="task-prompt">{{ selectedTask.text }}</p>
         <p v-if="selectedTask?.error" class="error">{{ selectedTask.error }}</p>
 
+        <div class="legend">
+          <span v-for="name in AGENTS" :key="name" class="agent-tag" :class="`a-${name}`">{{ name }}</span>
+          <span class="agent-tag a-other">other</span>
+        </div>
         <div ref="feedEl" class="feed" @scroll="onFeedScroll">
           <p v-if="feed.length === 0" class="muted">No events yet.</p>
           <div
@@ -290,7 +300,7 @@ onBeforeUnmount(() => {
             :class="eventClass(event)"
           >
             <span class="time">{{ eventTime(event) }}</span>
-            <span class="agent">{{ event.agent ?? '?' }}</span>
+            <span class="agent"><span class="agent-tag" :class="agentClass(event)">{{ event.agent ?? '?' }}</span></span>
             <span class="type">{{ event.type ?? '?' }}</span>
             <span class="summary">{{ eventSummary(event) }}</span>
           </div>
@@ -430,6 +440,20 @@ h2 { font-size: 14px; margin: 0 0 8px; }
 .t-task_done { border-left-color: #1f883d; background: #f0fff4; }
 .t-task_failed { border-left-color: #cf222e; background: #ffebe9; }
 .t-unknown { border-left-color: #8c959f; color: #57606a; font-style: italic; }
+
+.legend { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.agent-tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+  font-style: normal;
+}
+.a-orchestrator { background: #ddf4ff; color: #0550ae; }
+.a-writer { background: #fbefff; color: #8250df; }
+.a-reviewer { background: #fff1e5; color: #bc4c00; }
+.a-other { background: #eaeef2; color: #57606a; }
 
 .files { display: flex; gap: 16px; align-items: flex-start; }
 .file-list { width: 280px; flex-shrink: 0; }
