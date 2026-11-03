@@ -39,4 +39,4 @@ npm run dev
 | Nuxt | 4.6.4 |
 | FastAPI | 0.162.0 |
 | uvicorn | 0.54.0 |
-| Claude Code CLI | TBD — `claude` not on PATH yet |
+| Claude Code CLI | 2.1.317 (`~/.local/bin/claude`) |

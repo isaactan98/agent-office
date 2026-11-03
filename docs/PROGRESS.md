@@ -3,9 +3,9 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 0 done, except recording `claude --version` (committed in 988be0a)
+- Phase: 0 done
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: Claude Code CLI not installed (`claude` not on PATH). Needed before Phase 1.
+- Blockers: none. Claude Code CLI 2.1.317 installed; Pro login unverified.
 
 ## Log
 
@@ -18,10 +18,11 @@ Newest entry on top. Updated at the end of each session (`prompts/session-end.md
   `curl 127.0.0.1:8000/health` → `{"status":"ok"}`, `lsof` shows listen on
   127.0.0.1:8000 only; `npm run dev` → HTTP 200 on localhost:3000; `npm run build`
   → build complete; `git add -A --dry-run` → no .venv/node_modules/.nuxt/tasks/.env.
-- Not done: `claude --version` not recorded (README says TBD). Claude Code's attempt
-  to run the installer was blocked by its permission system; I install it myself.
-- Next: install Claude Code CLI, log in with Pro, record version in README; then
-  Phase 1 (`prompts/01-sdk-spike.md`) in a new session.
+- CLI: Claude Code's attempt to run the installer was blocked by its permission
+  system; I ran it myself. `claude --version` → `2.1.317 (Claude Code)`, on PATH at
+  `~/.local/bin/claude`. Recorded in README.
+- Next: run `claude` once and log in with Pro (unverified); then Phase 1
+  (`prompts/01-sdk-spike.md`) in a new session.
 - Open questions: none.
 <!--
 ### YYYY-MM-DD — <JB|SG> — <machine>
