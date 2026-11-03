@@ -3,11 +3,60 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 4 done
+- Phase: 5 done
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `uv run pytest` → 121 passed; `npm run build` → build complete.
+- Blockers: none. `uv run pytest` → 152 passed; `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-03 — SG — M3 MacBook Air (session 6)
+- Done: Phase 5 orchestrator + subagents. New `app/agents.py`: orchestrator
+  system prompt (33 lines, passed as `system_prompt`), `writer`
+  (Read/Write/Edit, maxTurns 10) and `reviewer` (Read/Glob/Grep/Write,
+  maxTurns 8) as `AgentDefinition`s in `ClaudeAgentOptions.agents`. Session
+  tools = Read/Write/Edit/Glob/Grep + `Agent` (the delegation tool).
+  `subagent_start`/`subagent_stop` come from the SDK's SubagentStart/
+  SubagentStop hooks (`agent` = `agent_type`, `agent_id` = SDK id; stop
+  summary includes the subagent's last reply). Path guard additions:
+  reviewer may Write only `output/review.md` (literal path, so a symlinked
+  review.md is denied); `Agent` calls only from the orchestrator, only
+  `writer`/`reviewer`, only fields description/prompt/subagent_type/
+  run_in_background, `run_in_background` must be false, max 4 allowed
+  per task (5th denied). Manifest `agents` is now a map name → run count
+  (was a list). The orchestrator writes `summary.md`; the runner writes the
+  result text only if it is missing. `agent_message` is emitted only for
+  messages without `parent_tool_use_id`. Frontend: coloured agent tag per
+  feed row + legend. 31 new tests. Committed as 61863a3 (not pushed).
+- Verified by: installed SDK 0.2.177 `types.py` (`agents: dict[str,
+  AgentDefinition]`, SubagentStart/Stop inputs with required `agent_id`/
+  `agent_type`, optional on tool hooks); bundled CLI strings: tool name
+  `Agent` (legacy `Task`), input keys description/prompt/subagent_type/
+  model/effort/run_in_background/name/team_name/mode/isolation/cwd, agents
+  run in the background unless `run_in_background` is false.
+  `uv run pytest` → 152 passed. `npm run build` → build complete. 1 real
+  run (of 2 allowed), backend started with `env -i`, `lsof` → 127.0.0.1:8000
+  only: Kangkar Pulai prompt → task
+  `20261103-231235-write-output-route-md-a-short` `done` in ~2 min, 5 turns;
+  `python -m app.events` → "OK: 31 events, seq strictly increasing"; per
+  agent: orchestrator 11, writer 12, reviewer 8; 3 `subagent_start`
+  (writer, reviewer, writer fix); no `tool_denied`; manifest agents
+  `{"orchestrator": 1, "writer": 2, "reviewer": 1}`; reviewer's only
+  Write was `output/review.md` (plus Glob `output/**`, Read
+  `output/route.md`). PreToolUse fires inside subagents: their
+  `tool_start` events carry their own agent/agent_id.
+- Notes: the prompt says the reviewer is read/search only, but it must write
+  review.md, so it has Write limited by the guard. Subagent text is not in
+  the feed (`forward_subagent_text` off). `subagent_stop` summaries can
+  contain absolute paths (from the subagent's reply). Writer output was
+  ~490 words, above "a few hundred". The 4-call cap and the background
+  deny were not hit in the live run (unit tests only). The UI tags/legend
+  were checked by build only, not seen in a browser: unverified.
+- Next: Phase 6 (`prompts/06-office-2d.md`) in a new session.
+- Open questions: should PLAN.md state the manifest `agents` shape
+  (name → count)? (Still open: `FRONTEND_ORIGIN` in `.env.example`;
+  `tool` may be `null` in PLAN.md; pin a cheaper default model — multi-agent
+  runs now cost more; spend a run on a live hook deny; claude.ai login
+  terms; `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-03 — SG — M3 MacBook Air (session 5)
 - Done: Phase 4 web UI. Backend (`app/main.py`): `WS /ws/tasks/{task_id}`
