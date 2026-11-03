@@ -3,11 +3,48 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 1 done (go)
+- Phase: 2 done
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. Pro login verified (`claude auth status` → claude.ai, pro).
+- Blockers: none. `uv run pytest` → 63 passed; `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-03 — SG — M3 MacBook Air (session 3)
+- Done: Phase 2 task runner. `app/tasks.py` (task_id
+  `YYYYMMDD-HHMMSS-<slug>`, slug ascii ≤30 chars; task dir with
+  `manifest.json` + `output/`; status `queued → running → done|failed`, other
+  changes raise; `task_dir()` rejects invalid ids). `app/runner.py`
+  (`run_task()`: one SDK session, cwd = task dir, tools
+  Read/Write/Edit/Glob/Grep, same isolation options as the spike,
+  `max_turns=20`; PreToolUse hook `HookMatcher(matcher=None,
+  on_failure="block")` denies paths outside the task dir — `..`, absolute,
+  `~`, symlinks incl. dangling/loops, Glob `pattern`/Grep `glob`+`path` —
+  and denies unknown tools; writes `summary.md`; errors → `failed` + `error`;
+  refuses if `ANTHROPIC_API_KEY` name is present). `app/main.py`
+  (`POST /tasks` → 409 while running, `GET /tasks` newest first skipping
+  non-task dirs like `spike-*`, `GET /tasks/{id}` → 400 bad format / 404
+  missing). Tests: `conftest.py`, `test_tasks.py`, `test_runner.py`
+  (path guard + `run_task` with a fake `query`), `test_api.py` (fake
+  `run_task`). Committed as 3cbcaf8 (not pushed).
+- Verified by: Glob/Grep input keys (`pattern`, `path`, `glob`) checked in the
+  bundled CLI binary; hook types in installed `types.py`. `uv run pytest` →
+  63 passed. 1 real run (of 2 allowed), backend started with `env -i`:
+  `POST /tasks` "Write output/hello.md with a two-line greeting" → 200
+  `20261103-185053-write-output-hello-md-with-a-t`; immediate second POST →
+  409; task `done` in ~12 s, `output/hello.md` (2 lines) and `summary.md`
+  exist; `lsof` → listen on 127.0.0.1:8000 only. `find -newer` marker: no new
+  repo files outside `tasks/`; in `$HOME` (depth 2, excl. `~/.claude`,
+  `~/Library`) only `~/.claude.json` (CLI bookkeeping, as in Phase 1).
+  `npm run build` → build complete.
+- Notes: the live run never attempted an outside path, so a hook **deny**
+  in a real SDK session is unverified (unit tests only). `agents` in the
+  manifest is `["orchestrator"]`. Model still not pinned (default Opus).
+  No `events.jsonl` yet (Phase 3). A manifest left `running` after a server
+  crash is not recovered.
+- Next: Phase 3 (`prompts/03-events.md`) in a new session.
+- Open questions: pin a cheaper default model? Spend a run to verify a live
+  hook deny? (Still open from session 2: claude.ai login terms;
+  `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-03 — SG — M3 MacBook Air (session 2)
 - Done: Phase 1 SDK spike. Added `claude-agent-sdk` 0.2.177 (bundles CLI
