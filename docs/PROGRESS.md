@@ -3,11 +3,41 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 0 done
+- Phase: 1 done (go)
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. Claude Code CLI 2.1.317 installed; Pro login unverified.
+- Blockers: none. Pro login verified (`claude auth status` → claude.ai, pro).
 
 ## Log
+
+### 2026-11-03 — SG — M3 MacBook Air (session 2)
+- Done: Phase 1 SDK spike. Added `claude-agent-sdk` 0.2.177 (bundles CLI
+  2.1.317). `backend/spikes/sdk_spike.py` runs one haiku task in a fresh
+  `tasks/spike-<timestamp>/` with `tools=["Read","Write"]`,
+  `permission_mode="dontAsk"`, `setting_sources=[]`, `strict_mcp_config=True`,
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `backend/spikes/README.md` lists verified
+  SDK names and surprises. Committed as cdeead3 (not pushed).
+- Verified by: `env | grep -i anthropic` → no `ANTHROPIC_API_KEY` (names only).
+  1 spike run (of 2 allowed), launched with `env -i` because the Claude desktop
+  app shell exports `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_*` vars: init reported
+  `apiKeySource='none'`, `tools=['Read','Write']`, `mcp_servers=[]`, cwd = spike
+  dir; one `Write` to `<spike dir>/notes.md`; result `success`, 2 turns, 8.6 s,
+  `permission_denials: []`; no `~/.claude/skills` entries in init `skills`.
+  `git status` → only pyproject.toml, uv.lock, spikes/; `find -newer` in repo →
+  only notes.md plus gitignored `.pyc`. `claude auth status` (installed and
+  SDK-bundled CLI, clean env) → `loggedIn: true`, `authMethod: claude.ai`,
+  `subscriptionType: pro`. `uv run pytest` → 1 passed; `npm run build` → build
+  complete.
+- Notes: `allowed_tools` only auto-approves; `tools` restricts. Default
+  `setting_sources=None` loads `~/.claude`. CLI still writes its own transcript
+  and `.claude.json` backup under `~/.claude`. Default model was claude-opus-5-5;
+  `total_cost_usd` (~$0.021) is a list-price estimate, not a bill. No PreToolUse
+  path hook yet. Start the backend from a plain terminal, not inside Claude Code.
+- Next: Phase 2 (`prompts/02-task-runner.md`) in a new session.
+- Open questions: the Agent SDK quickstart says third-party developers may not
+  offer claude.ai login in their products without approval; this project is
+  personal/single-user, so assumed not to apply (your call). Whether to pin a
+  cheaper default model, and whether to relocate CLI state via
+  `CLAUDE_CONFIG_DIR` (may move the login; untested).
 
 ### 2026-11-03 — SG — M3 MacBook Air
 - Done: Phase 0 skeleton. `backend/` (uv, FastAPI `GET /health`, `app/config.py`
