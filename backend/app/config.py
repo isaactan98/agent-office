@@ -11,3 +11,6 @@ TASKS_DIR = Path(os.environ.get("TASKS_DIR") or BACKEND_DIR.parent / "tasks").re
 # Bind to localhost only. Remote access goes through `tailscale serve`, never a public URL.
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
+
+# The Nuxt dev server. The only origin allowed by CORS and on the WebSocket.
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
