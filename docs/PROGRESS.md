@@ -3,12 +3,86 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 7 done (all phases in PLAN.md done)
+- Phase: 8 done (3D office + office-first UI; asked in chat, no prompt file)
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `uv run pytest` → 242 passed; `npm test` → 20 passed;
-  `npm run build` → build complete.
+- Blockers: none. `npm test` → 20 passed; `npm run build` → build complete.
+  Backend untouched this session (`uv run pytest` not re-run).
 
 ## Log
+
+### 2026-11-05 — SG — M3 MacBook Air (session 9)
+- Done: Phase 8, 3D office. Added `three` 0.186.1 (pinned exact; 0.187.0
+  skipped as only a week old). No three.js skill was installed, so the
+  scene was written directly. New `frontend/app/utils/officeScene.ts`
+  draws the reducer's `OfficeState` with three.js: orthographic camera at
+  a fixed isometric angle, dark night office with glass outer walls (front
+  and right), a glass meeting room (8 seats for unknown agents), lounge
+  (sofa, lamp, bookshelf), coffee counter, back-to-back desk cluster
+  (writer/reviewer south row facing the back wall, spare desks north
+  row), orchestrator's 3-monitor desk by the windows; warm point lights,
+  moonlight with soft shadows. Robots: cube heads with a face screen and
+  pixel eyes, in lighter versions of the feed tag colours; poses for
+  walking / working (typing, code scrolls on its monitors, coloured
+  glow, floor ring pulses) / talking / idle; blink. Name tag + status,
+  speech bubble and the `tool_denied` "!" are HTML labels
+  (CSS2DRenderer). Walks now follow waypoints (corridor, side aisles,
+  far side of the meeting table) so nobody walks through desks.
+  Everything built from primitives and canvas textures, no asset files.
+  `officeState.ts` (reducer) and its tests are unchanged. `Office.vue`
+  keeps live/replay logic, loads three.js in `onMounted` only (no WebGL in
+  SSR), disposes the scene on unmount, fills its container, works with no
+  task open, shows replay controls and the agent legend as overlays, and
+  takes `insetRight` so the camera frames the room left of the chat
+  panel. `app.vue`: dark theme; sidebar = brand, usage, task list; the
+  office fills the main area; the chat panel floats inside it on the
+  right (Chat tab: task header + Cancel, feed, input; Files tab: list +
+  viewer), collapsible (camera re-frames); ≤900 px the panel goes below
+  the office. Camera: OrbitControls (three's `examples/jsm`, no new
+  dependency) — drag to rotate (polar 18°–75°, any azimuth), scroll /
+  pinch to zoom towards the cursor (0.6×–4×), right-drag / two fingers to
+  pan (orbit centre clamped to the floor), damping, "Reset view" button;
+  the frustum is sized from the default view so resizing keeps the user's
+  angle and zoom; the back / left wall (with its windows, art, door, lamps)
+  is hidden while the camera is behind it. Robots redone to look cuter:
+  round chunky body with a belly patch, capsule limbs, big soft head with
+  a rounded dark face screen, glowing pill eyes (blink; scan side to side
+  while working), blush cheeks, a smile that becomes an open moving mouth
+  while talking, round ear caps, a wobbling antenna with a glowing tip;
+  hop + squash when walking, idle sway and look-around, per-robot phase
+  offset. First pass committed as 2be24bd (not pushed); the restyle,
+  panel layout, camera controls and new robots are not committed yet.
+- Verified by: `npm test` → 20 passed; `npm run build` → build complete.
+  In-app browser against the running backend (no task run spent): replay
+  of `20261103-231235-write-output-route-md-a-short` at 4× showed
+  orchestrator, writer and reviewer with statuses idle / walking /
+  working / talking (read from the label DOM during replay) and the
+  bubble "The guide is ready in `output/route.md`,…"; no console errors.
+  Switching tasks leaves 1 WebGL canvas and 1 label layer. Panel collapse
+  re-frames the room to full width. Files tab listed 5 files and opened
+  `output/route.md`. 375 px wide: office (355×266) above the panel, page
+  width 375 (no horizontal scroll). Camera: scroll zoomed in towards the
+  orchestrator (room seen up close), drag rotated ~90° and ~180° (left
+  wall, then back wall hidden as expected), Reset view returned to the
+  default angle; console had no errors.
+- Notes: the robots' faces were not seen up close in the browser: the
+  default view shows the seated robots from behind, and the browser pane
+  went hidden (no animation frames) before a paused mid-walk shot — face
+  detail unverified. On the ≤900 px layout, touch-dragging on the office
+  rotates it instead of scrolling the page (OrbitControls sets
+  `touch-action: none`). No `@types/three` (not asked for); the build does not
+  type-check, so editors show `three` as untyped. The browser pane
+  throttles frames, so smoothness at full frame rate is unverified. A live
+  (non-replay) task with the new office: unverified. Robot colours are
+  lighter than the feed tag text colours (same hues). Client bundle grew
+  (three.js), loaded only when the office mounts.
+- Next: run a real task and watch it live in the 3D office; decide
+  whether to commit `@types/three`.
+- Open questions: add a prompt file for Phase 8 so PLAN.md's "one prompt per
+  phase" stays true? (Still open from session 8: `task_cancelled` event
+  type; `DAILY_TASK_CAP`/`FRONTEND_ORIGIN` in `.env.example`; re-queue
+  `queued` manifests after restart; Node test runner vs vitest; manifest
+  `agents` shape in PLAN.md; `tool` may be `null`; cheaper default model;
+  live hook deny; claude.ai login terms; `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-04 — SG — M3 MacBook Air (session 8)
 - Done: Phase 7 hardening. `app/main.py`: `POST /tasks` always creates a

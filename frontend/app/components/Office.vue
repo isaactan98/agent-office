@@ -3,14 +3,15 @@
 // All state comes from utils/officeState.ts (pure reducer). This component
 // only feeds it events (live from the feed, or replayed from events.jsonl);
 // utils/officeScene.ts draws the result in 3D with three.js.
-import { WALK_MS, BUBBLE_MS, initialState, reduce, tick } from '~/utils/officeState'
+import { KNOWN_AGENTS, WALK_MS, BUBBLE_MS, initialState, reduce, tick } from '~/utils/officeState'
 import type { OfficeEvent, OfficeState } from '~/utils/officeState'
 import type { OfficeScene } from '~/utils/officeScene'
 
 const props = defineProps<{
-  taskId: string
+  taskId: string | null // null: no task open, an empty office
   events: OfficeEvent[] // the live feed (past events first, then new ones)
   finished: boolean // replay is offered for done / failed / cancelled tasks only
+  insetRight: number // px on the right covered by the chat panel
 }>()
 
 const apiBase = useRuntimeConfig().public.apiBase as string
@@ -49,6 +50,7 @@ let replayClock = 0
 let replayEndMs = 0
 
 async function startReplay() {
+  if (!props.taskId) return
   loading.value = true
   replayError.value = null
   try {
@@ -95,6 +97,7 @@ function togglePlay() {
 // ---- Drawing (three.js, utils/officeScene.ts) ----
 const sceneEl = ref<HTMLDivElement | null>(null)
 const sceneError = ref<string | null>(null)
+// Not reactive: three.js objects must not be wrapped in Vue proxies.
 let scene: OfficeScene | null = null
 let frame = 0
 let lastFrameMs = 0
@@ -124,12 +127,15 @@ onMounted(async () => {
   if (unmounted || !sceneEl.value) return
   try {
     scene = createOfficeScene(sceneEl.value)
+    scene.setInsetRight(props.insetRight)
   } catch (err) {
     sceneError.value = `3D view unavailable (WebGL): ${(err as Error)?.message ?? err}`
     return
   }
   frame = requestAnimationFrame(loop)
 })
+
+watch(() => props.insetRight, px => scene?.setInsetRight(px))
 
 onBeforeUnmount(() => {
   unmounted = true
@@ -141,11 +147,14 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="office">
+    <div ref="sceneEl" class="office-scene">
+      <p v-if="sceneError" class="scene-error">{{ sceneError }}</p>
+    </div>
     <div class="office-bar">
-      <strong>Office</strong>
       <template v-if="mode === 'live'">
-        <span class="muted">live</span>
+        <span class="pill"><span class="live-dot" />live</span>
         <button
+          v-if="taskId"
           :disabled="!finished || loading"
           :title="finished ? 'Replay events.jsonl' : 'Replay is available once the task has finished'"
           @click="startReplay"
@@ -154,45 +163,71 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <template v-else>
-        <span class="muted">replay: {{ replayPos }}/{{ replayEvents.length }} events</span>
+        <span class="pill">replay {{ replayPos }}/{{ replayEvents.length }}</span>
         <button @click="togglePlay">{{ replayFinished ? 'Restart' : playing ? 'Pause' : 'Play' }}</button>
         <button :class="{ active: speed === 1 }" @click="speed = 1">1×</button>
         <button :class="{ active: speed === 4 }" @click="speed = 4">4×</button>
         <button @click="mode = 'live'">Back to live</button>
       </template>
-      <span v-if="replayError" class="error">{{ replayError }}</span>
+      <span v-if="replayError" class="pill error">{{ replayError }}</span>
+      <button
+        v-if="!sceneError"
+        title="Drag to rotate, scroll or pinch to zoom, right-drag or two fingers to pan"
+        @click="scene?.resetView()"
+      >
+        Reset view
+      </button>
     </div>
-    <div ref="sceneEl" class="office-scene">
-      <p v-if="sceneError" class="scene-error">{{ sceneError }}</p>
+    <div class="office-legend">
+      <span v-for="name in KNOWN_AGENTS" :key="name" class="agent-tag" :class="`a-${name}`">{{ name }}</span>
+      <span class="agent-tag a-other">other</span>
     </div>
   </div>
 </template>
 
 <style scoped>
-.office-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
-.office-bar button {
-  font: inherit;
-  font-size: 12px;
-  padding: 2px 10px;
-  border: 1px solid #d0d7de;
-  border-radius: 6px;
-  background: #fff;
-  cursor: pointer;
-}
-.office-bar button:disabled { color: #8c959f; cursor: not-allowed; }
-.office-bar button.active { background: #ddf4ff; border-color: #54aeff; }
-.office-scene {
+.office {
   position: relative;
   width: 100%;
-  aspect-ratio: 16 / 9;
-  max-height: 64vh;
+  height: 100%;
   overflow: hidden;
-  border-radius: 12px;
+  border-radius: 16px;
   background:
-    radial-gradient(ellipse at 50% 35%, #3a3a6a 0%, #1e1d3a 55%, #12111f 100%);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(20, 18, 40, 0.25);
+    radial-gradient(ellipse at 40% 30%, #1d2236 0%, #11131d 60%, #0b0c12 100%);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
-.scene-error { color: #ffb4a8; padding: 12px; margin: 0; font-size: 13px; }
+.office-scene { position: absolute; inset: 0; cursor: grab; }
+.office-scene:active { cursor: grabbing; }
+.office-bar, .office-legend {
+  position: absolute;
+  left: 14px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.office-bar { top: 14px; }
+.office-legend { bottom: 14px; }
+.pill, .office-bar button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(20, 22, 32, 0.75);
+  color: #d6dae6;
+  backdrop-filter: blur(8px);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.office-bar button { cursor: pointer; }
+.office-bar button:hover:not(:disabled) { border-color: rgba(255, 255, 255, 0.25); }
+.office-bar button:disabled { color: #6b7086; cursor: not-allowed; }
+.office-bar button.active { background: rgba(107, 156, 255, 0.25); border-color: #6b9cff; }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: #3fdc6a; box-shadow: 0 0 6px #3fdc6a; }
+.pill.error { color: #ff9a8a; }
+.scene-error { color: #ffb4a8; padding: 60px 16px; margin: 0; font-size: 13px; }
 </style>
 
 <style>

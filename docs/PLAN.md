@@ -13,6 +13,7 @@ starting the next. A phase is done only when every acceptance check passes.
 | 5 | `05-orchestrator.md` | Orchestrator + 2 subagents, events tagged per agent |
 | 6 | `06-office-2d.md` | 2D office canvas driven by events, replay from `events.jsonl` |
 | 7 | `07-hardening.md` | Queue, usage log, path checks, Tailscale access |
+| 8 | — (asked in chat, no prompt file) | 3D office (three.js) replacing the 2D canvas; office-first dark UI with the chat panel inside the office |
 
 ## Task directory contract
 ```

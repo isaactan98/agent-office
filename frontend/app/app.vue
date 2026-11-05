@@ -1,6 +1,7 @@
 <script setup lang="ts">
-// Single page: task input, live event feed, task list, file viewer, usage.
-// Data is loaded in the browser only (onMounted), never during SSR.
+// Single page: the 3D office fills the screen; the chat panel inside it holds
+// the task input, live event feed and file viewer; the sidebar holds the task
+// list and usage. Data is loaded in the browser only (onMounted), never during SSR.
 
 interface Task {
   task_id: string
@@ -71,6 +72,17 @@ const cancelError = ref<string | null>(null)
 const usage = ref<Usage | null>(null)
 
 const feedEl = ref<HTMLElement | null>(null)
+const tab = ref<'chat' | 'files'>('chat')
+const panelCollapsed = ref(false)
+const isNarrow = ref(false) // ≤ 900 px: panel goes below the office instead of over it
+// Chat panel width + its right margin + a gap; the office frames the room in
+// the space left of it.
+const PANEL_INSET = 400 + 16 + 16
+const panelInset = computed(() => (isNarrow.value || panelCollapsed.value ? 0 : PANEL_INSET))
+let narrowQuery: MediaQueryList | null = null
+function onNarrowChange(e: MediaQueryListEvent) {
+  isNarrow.value = e.matches
+}
 let stickToBottom = true
 let socket: WebSocket | null = null
 let seenSeq = new Set<number>()
@@ -240,7 +252,7 @@ function onFeedScroll() {
   if (el) stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
 }
 
-watch(() => feed.value.length, async () => {
+watch([() => feed.value.length, tab, panelCollapsed], async () => {
   await nextTick()
   if (stickToBottom && feedEl.value) feedEl.value.scrollTop = feedEl.value.scrollHeight
 })
@@ -282,6 +294,9 @@ function tokenLabel(key: string): string {
 }
 
 onMounted(async () => {
+  narrowQuery = window.matchMedia('(max-width: 900px)')
+  isNarrow.value = narrowQuery.matches
+  narrowQuery.addEventListener('change', onNarrowChange)
   await refreshTasks()
   refreshUsage()
   const fromUrl = new URLSearchParams(window.location.search).get('task')
@@ -294,6 +309,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  narrowQuery?.removeEventListener('change', onNarrowChange)
   clearInterval(pollTimer)
   closeSocket()
 })
@@ -302,11 +318,18 @@ onBeforeUnmount(() => {
 <template>
   <div class="layout">
     <aside class="sidebar">
-      <h1>agent-office</h1>
-      <section v-if="usage" class="usage">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"><i /><i /></span>
+        <div>
+          <h1>agent-office</h1>
+          <p class="muted small">orchestrator + subagents</p>
+        </div>
+      </div>
+
+      <section v-if="usage" class="card usage">
         <h2>Usage</h2>
         <p :class="{ error: usage.tasks_created_today >= usage.daily_task_cap }">
-          Tasks today: {{ usage.tasks_created_today }} / {{ usage.daily_task_cap }}
+          Tasks today: <strong>{{ usage.tasks_created_today }}</strong> / {{ usage.daily_task_cap }}
         </p>
         <table>
           <thead>
@@ -334,6 +357,8 @@ onBeforeUnmount(() => {
         </table>
         <p class="muted small">est. $ = the SDK's list-price estimate, not a bill (Pro plan).</p>
       </section>
+
+      <h2 class="section-title">Tasks</h2>
       <p v-if="tasks.length === 0" class="muted">No tasks yet.</p>
       <ul class="task-list">
         <li
@@ -349,90 +374,77 @@ onBeforeUnmount(() => {
       </ul>
     </aside>
 
-    <main class="main">
-      <form class="chat" @submit.prevent="send">
-        <textarea
-          v-model="input"
-          rows="3"
-          placeholder="Describe a task…"
-          :disabled="sending"
-          @keydown.enter.meta.prevent="send"
-        />
-        <div class="chat-row">
-          <button type="submit" :disabled="sending || !input.trim()">
-            {{ runningTask ? 'Queue' : 'Send' }}
-          </button>
-          <span v-if="runningTask" class="muted">
-            A task is running<template v-if="queuedCount">, {{ queuedCount }} queued</template>.
-            New tasks wait in the queue.
-          </span>
-          <span v-if="sendError" class="error">{{ sendError }}</span>
-        </div>
-      </form>
+    <main class="stage">
+      <Office
+        :key="selectedId ?? 'none'"
+        :task-id="selectedId"
+        :events="feed"
+        :finished="['done', 'failed', 'cancelled'].includes(selectedTask?.status ?? '')"
+        :inset-right="panelInset"
+      />
 
-      <section v-if="selectedId" class="task">
-        <header class="task-header">
-          <strong>{{ selectedId }}</strong>
-          <span v-if="selectedTask" class="badge" :class="`s-${selectedTask.status}`">
-            {{ selectedTask.status }}
-          </span>
-          <span class="muted">feed: {{ connection }}</span>
-          <button
-            v-if="selectedTask && (selectedTask.status === 'queued' || selectedTask.status === 'running')"
-            class="cancel"
-            :disabled="cancelling"
-            @click="cancelTask(selectedTask.task_id)"
-          >
-            {{ cancelling ? 'Cancelling…' : 'Cancel' }}
-          </button>
+      <button v-if="panelCollapsed && !isNarrow" class="panel-open" @click="panelCollapsed = false">
+        ‹ Chat
+      </button>
+
+      <section v-show="!panelCollapsed || isNarrow" class="panel">
+        <header class="panel-head">
+          <div class="tabs">
+            <button :class="{ active: tab === 'chat' }" @click="tab = 'chat'">Chat</button>
+            <button :class="{ active: tab === 'files' }" :disabled="!selectedId" @click="tab = 'files'">
+              Files<span v-if="files.length" class="count">{{ files.length }}</span>
+            </button>
+          </div>
+          <button v-if="!isNarrow" class="icon" title="Hide panel" @click="panelCollapsed = true">›</button>
         </header>
-        <p v-if="cancelError" class="error">{{ cancelError }}</p>
-        <p v-if="selectedTask" class="task-prompt">{{ selectedTask.text }}</p>
-        <p v-if="selectedTask?.error" class="error">{{ selectedTask.error }}</p>
 
-        <Office
-          :key="selectedId"
-          :task-id="selectedId"
-          :events="feed"
-          :finished="['done', 'failed', 'cancelled'].includes(selectedTask?.status ?? '')"
-        />
-
-        <div class="legend">
-          <span v-for="name in AGENTS" :key="name" class="agent-tag" :class="`a-${name}`">{{ name }}</span>
-          <span class="agent-tag a-other">other</span>
+        <div v-if="selectedId" class="task-head">
+          <div class="task-head-row">
+            <span v-if="selectedTask" class="badge" :class="`s-${selectedTask.status}`">{{ selectedTask.status }}</span>
+            <span class="muted small mono">feed: {{ connection }}</span>
+            <button
+              v-if="selectedTask && (selectedTask.status === 'queued' || selectedTask.status === 'running')"
+              class="cancel"
+              :disabled="cancelling"
+              @click="cancelTask(selectedTask.task_id)"
+            >
+              {{ cancelling ? 'Cancelling…' : 'Cancel' }}
+            </button>
+          </div>
+          <p v-if="selectedTask" class="task-prompt">{{ selectedTask.text }}</p>
+          <p class="task-id">{{ selectedId }}</p>
+          <p v-if="cancelError" class="error small">{{ cancelError }}</p>
+          <p v-if="selectedTask?.error" class="error small">{{ selectedTask.error }}</p>
         </div>
-        <div ref="feedEl" class="feed" @scroll="onFeedScroll">
-          <p v-if="feed.length === 0" class="muted">No events yet.</p>
+
+        <div v-show="tab === 'chat'" ref="feedEl" class="feed" @scroll="onFeedScroll">
+          <p v-if="!selectedId" class="muted empty">Pick a task on the left, or describe a new one below.</p>
+          <p v-else-if="feed.length === 0" class="muted empty">No events yet.</p>
           <div
             v-for="(event, index) in feed"
             :key="event.seq ?? `i${index}`"
             class="row"
             :class="eventClass(event)"
           >
-            <span class="time">{{ eventTime(event) }}</span>
-            <span class="agent"><span class="agent-tag" :class="agentClass(event)">{{ event.agent ?? '?' }}</span></span>
-            <span class="type">{{ event.type ?? '?' }}</span>
-            <span class="summary">{{ eventSummary(event) }}</span>
+            <div class="row-head">
+              <span class="agent-tag" :class="agentClass(event)">{{ event.agent ?? '?' }}</span>
+              <span class="type">{{ event.type ?? '?' }}</span>
+              <span class="time">{{ eventTime(event) }}</span>
+            </div>
+            <div class="summary">{{ eventSummary(event) }}</div>
           </div>
         </div>
 
-        <div class="files">
-          <div class="file-list">
-            <h2>Files</h2>
-            <p v-if="files.length === 0" class="muted">No files.</p>
-            <ul>
-              <li v-for="file in files" :key="file.path">
-                <button
-                  class="link"
-                  :class="{ selected: openFile?.path === file.path }"
-                  @click="showFile(file.path)"
-                >
-                  {{ file.path }}
-                </button>
-                <span class="muted">{{ formatSize(file.size) }}</span>
-              </li>
-            </ul>
-          </div>
+        <div v-show="tab === 'files'" class="files">
+          <p v-if="files.length === 0" class="muted empty">No files.</p>
+          <ul class="file-list">
+            <li v-for="file in files" :key="file.path">
+              <button class="link" :class="{ selected: openFile?.path === file.path }" @click="showFile(file.path)">
+                {{ file.path }}
+              </button>
+              <span class="muted small">{{ formatSize(file.size) }}</span>
+            </li>
+          </ul>
           <div v-if="openFile" class="file-view">
             <h2>{{ openFile.path }}</h2>
             <p v-if="openFile.error" class="error">{{ openFile.error }}</p>
@@ -440,153 +452,243 @@ onBeforeUnmount(() => {
             <pre v-else>{{ openFile.content }}</pre>
           </div>
         </div>
+
+        <form class="composer" @submit.prevent="send">
+          <textarea
+            v-model="input"
+            rows="2"
+            placeholder="Describe a task…  (⌘↵ to send)"
+            :disabled="sending"
+            @keydown.enter.meta.prevent="send"
+          />
+          <div class="composer-row">
+            <span v-if="sendError" class="error small">{{ sendError }}</span>
+            <span v-else-if="runningTask" class="muted small">
+              A task is running<template v-if="queuedCount">, {{ queuedCount }} queued</template>. New tasks wait in the queue.
+            </span>
+            <span v-else class="muted small">One task runs at a time.</span>
+            <button type="submit" :disabled="sending || !input.trim()">
+              {{ runningTask ? 'Queue' : 'Send' }}
+            </button>
+          </div>
+        </form>
       </section>
-      <p v-else class="muted">Pick a task on the left, or send a new one.</p>
     </main>
   </div>
 </template>
 
 <style>
 * { box-sizing: border-box; }
+:root {
+  --bg: #0b0c12;
+  --surface: #12141c;
+  --surface-2: #181b25;
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #e4e7ef;
+  --muted: #8a90a6;
+  --accent: #6b9cff;
+  --green: #3fdc6a;
+  --red: #ff7b72;
+}
+html, body { height: 100%; }
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 14px;
-  color: #1f2328;
-  background: #f6f8fa;
+  color: var(--text);
+  background: var(--bg);
 }
-h1 { font-size: 18px; margin: 0 0 12px; }
-h2 { font-size: 14px; margin: 0 0 8px; }
-.muted { color: #6e7781; }
-.error { color: #cf222e; }
+h1 { font-size: 16px; margin: 0; letter-spacing: 0.01em; }
+h2 { font-size: 13px; margin: 0 0 8px; }
+.muted { color: var(--muted); }
+.error { color: var(--red); }
+.small { font-size: 12px; }
+.mono { font-family: ui-monospace, monospace; }
 
-.layout { display: flex; min-height: 100vh; }
+.layout { display: flex; height: 100vh; }
+
+/* ---- Sidebar ---- */
 .sidebar {
   width: 280px;
   flex-shrink: 0;
-  padding: 16px;
-  border-right: 1px solid #d0d7de;
-  background: #fff;
+  padding: 18px 14px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
   overflow-y: auto;
-  max-height: 100vh;
-  position: sticky;
-  top: 0;
 }
+.brand { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; }
+.brand p { margin: 2px 0 0; }
+.logo {
+  width: 34px;
+  height: 30px;
+  border-radius: 9px;
+  background: linear-gradient(145deg, #8fb4ff, #5b7fe0);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  box-shadow: 0 4px 14px rgba(107, 156, 255, 0.35);
+}
+.logo i { width: 5px; height: 8px; border-radius: 1px; background: #0f1220; }
+.card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+}
+.usage { margin-bottom: 18px; font-size: 12px; }
+.usage p { margin: 0 0 6px; }
+.usage table { border-collapse: collapse; width: 100%; }
+.usage th { color: var(--muted); font-weight: 500; }
+.usage th, .usage td { text-align: right; padding: 1px 4px; font-variant-numeric: tabular-nums; }
+.usage th:first-child, .usage td:first-child { text-align: left; color: var(--muted); }
+.section-title { text-transform: uppercase; font-size: 11px; letter-spacing: 0.08em; color: var(--muted); margin: 0 4px 6px; }
 .task-list { list-style: none; margin: 0; padding: 0; }
 .task-list li {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 8px;
   align-items: center;
-  padding: 8px;
-  border-radius: 6px;
+  padding: 8px 10px;
+  border-radius: 10px;
   cursor: pointer;
+  border: 1px solid transparent;
 }
-.task-list li:hover { background: #f3f4f6; }
-.task-list li.selected { background: #ddf4ff; }
+.task-list li:hover { background: rgba(255, 255, 255, 0.04); }
+.task-list li.selected { background: rgba(107, 156, 255, 0.12); border-color: rgba(107, 156, 255, 0.35); }
 .task-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.task-id { width: 100%; font-size: 11px; color: #6e7781; font-family: ui-monospace, monospace; }
+.task-id { width: 100%; font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; word-break: break-all; margin: 0; }
 
 .badge {
   font-size: 11px;
-  padding: 1px 6px;
+  padding: 1px 7px;
   border-radius: 10px;
-  background: #eaeef2;
-  color: #57606a;
+  background: rgba(255, 255, 255, 0.08);
+  color: #b7bcce;
 }
-.s-running, .s-queued { background: #fff8c5; color: #7d4e00; }
-.s-done { background: #dafbe1; color: #116329; }
-.s-failed, .s-cancelled { background: #ffebe9; color: #a40e26; }
+.s-running, .s-queued { background: rgba(242, 204, 96, 0.15); color: #f2cc60; }
+.s-done { background: rgba(63, 220, 106, 0.14); color: #6fe08f; }
+.s-failed, .s-cancelled { background: rgba(255, 123, 114, 0.14); color: #ff9a92; }
 
-.main { flex: 1; min-width: 0; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
-.chat textarea {
-  width: 100%;
-  font: inherit;
-  padding: 8px;
-  border: 1px solid #d0d7de;
-  border-radius: 6px;
-  resize: vertical;
+/* ---- Stage: the office fills it; the panel floats inside on the right ---- */
+.stage { position: relative; flex: 1; min-width: 0; padding: 12px; }
+.panel {
+  position: absolute;
+  top: 28px;
+  right: 28px;
+  bottom: 28px;
+  width: 400px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(16, 18, 27, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  backdrop-filter: blur(14px);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
 }
-.chat-row { display: flex; gap: 12px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
-.chat button {
+.panel-open {
+  position: absolute;
+  top: 28px;
+  right: 28px;
   font: inherit;
-  padding: 6px 16px;
-  border: 1px solid #1f883d;
-  border-radius: 6px;
-  background: #1f883d;
-  color: #fff;
+  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(16, 18, 27, 0.85);
+  color: var(--text);
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 10px 0;
+}
+.tabs { display: flex; gap: 4px; }
+.tabs button, .icon {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: none;
+  background: none;
+  color: var(--muted);
   cursor: pointer;
 }
-.chat button:disabled { background: #94d3a2; border-color: #94d3a2; cursor: not-allowed; }
-
-.task-header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-family: ui-monospace, monospace; }
-.task-header strong { word-break: break-all; }
+.tabs button.active { background: rgba(255, 255, 255, 0.08); color: var(--text); }
+.tabs button:disabled { opacity: 0.4; cursor: not-allowed; }
+.icon { font-size: 18px; line-height: 1; padding: 4px 10px; }
+.icon:hover, .tabs button:hover:not(:disabled) { color: var(--text); }
+.count {
+  margin-left: 6px;
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: rgba(107, 156, 255, 0.2);
+  color: #9bbcff;
+}
+.task-head { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.task-head p { margin: 4px 0 0; }
+.task-head-row { display: flex; gap: 10px; align-items: center; }
+.task-prompt { font-size: 13px; line-height: 1.4; }
 .cancel {
+  margin-left: auto;
   font: inherit;
+  font-size: 12px;
   padding: 2px 10px;
-  border: 1px solid #cf222e;
-  border-radius: 6px;
-  background: #fff;
-  color: #cf222e;
+  border: 1px solid rgba(255, 123, 114, 0.5);
+  border-radius: 8px;
+  background: none;
+  color: var(--red);
   cursor: pointer;
 }
 .cancel:disabled { opacity: 0.6; cursor: not-allowed; }
 
-.usage { margin-bottom: 16px; font-size: 12px; }
-.usage p { margin: 0 0 6px; }
-.usage table { border-collapse: collapse; width: 100%; }
-.usage th, .usage td { text-align: right; padding: 1px 4px; font-variant-numeric: tabular-nums; }
-.usage th:first-child, .usage td:first-child { text-align: left; color: #6e7781; }
-.small { font-size: 11px; }
-.task-prompt { margin: 8px 0; }
-
-.feed {
-  height: 45vh;
-  overflow-y: auto;
-  background: #fff;
-  border: 1px solid #d0d7de;
-  border-radius: 6px;
-  font-family: ui-monospace, monospace;
-  font-size: 12px;
-}
-.feed > .muted { padding: 8px; margin: 0; }
+.feed, .files { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 10px; }
+.empty { padding: 8px 4px; margin: 0; }
 .row {
-  display: grid;
-  grid-template-columns: 64px 100px 110px 1fr;
-  gap: 8px;
-  padding: 3px 8px;
-  border-left: 3px solid #d0d7de;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: 8px;
+  border-left: 2px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.025);
 }
-.row .summary { white-space: pre-wrap; word-break: break-word; }
-.row .type { font-weight: 600; }
-.t-task_queued, .t-task_started { border-left-color: #0969da; background: #f0f7ff; }
-.t-agent_message { border-left-color: #8250df; }
-.t-tool_start { border-left-color: #bf8700; }
-.t-tool_end { border-left-color: #9a6700; color: #57606a; }
-.t-tool_denied { border-left-color: #cf222e; background: #fff5f5; }
-.t-subagent_start, .t-subagent_stop { border-left-color: #1b7c83; }
-.t-task_done { border-left-color: #1f883d; background: #f0fff4; }
-.t-task_failed { border-left-color: #cf222e; background: #ffebe9; }
-.t-unknown { border-left-color: #8c959f; color: #57606a; font-style: italic; }
+.row-head { display: flex; gap: 8px; align-items: center; font-size: 11px; }
+.row .type { font-family: ui-monospace, monospace; font-weight: 600; color: #c5cadb; }
+.row .time { margin-left: auto; font-family: ui-monospace, monospace; color: var(--muted); }
+.row .summary { margin-top: 3px; font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; color: #cfd3df; }
+.t-task_queued, .t-task_started { border-left-color: #6b9cff; }
+.t-agent_message { border-left-color: #b18cff; background: rgba(177, 140, 255, 0.06); }
+.t-tool_start { border-left-color: #d6a23a; }
+.t-tool_end { border-left-color: #8a6d2c; }
+.t-tool_end .summary { color: var(--muted); }
+.t-tool_denied { border-left-color: var(--red); background: rgba(255, 123, 114, 0.08); }
+.t-subagent_start, .t-subagent_stop { border-left-color: #39c5cf; }
+.t-task_done { border-left-color: var(--green); background: rgba(63, 220, 106, 0.07); }
+.t-task_failed { border-left-color: var(--red); background: rgba(255, 123, 114, 0.1); }
+.t-unknown { border-left-color: #6b7086; font-style: italic; }
+.t-unknown .summary { color: var(--muted); }
 
-.legend { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
 .agent-tag {
   display: inline-block;
   font-size: 11px;
-  padding: 0 6px;
-  border-radius: 4px;
+  padding: 1px 7px;
+  border-radius: 6px;
   font-family: ui-monospace, monospace;
   font-style: normal;
 }
-.a-orchestrator { background: #ddf4ff; color: #0550ae; }
-.a-writer { background: #fbefff; color: #8250df; }
-.a-reviewer { background: #fff1e5; color: #bc4c00; }
-.a-other { background: #eaeef2; color: #57606a; }
+/* Same hues as the robots in the office. */
+.a-orchestrator { background: rgba(107, 156, 255, 0.18); color: #9bbcff; }
+.a-writer { background: rgba(177, 140, 255, 0.18); color: #c9b0ff; }
+.a-reviewer { background: rgba(255, 154, 92, 0.18); color: #ffb488; }
+.a-other { background: rgba(227, 231, 238, 0.12); color: #d0d5de; }
 
-.files { display: flex; gap: 16px; align-items: flex-start; }
-.file-list { width: 280px; flex-shrink: 0; }
-.file-list ul { list-style: none; margin: 0; padding: 0; }
-.file-list li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+.file-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.file-list li { display: flex; justify-content: space-between; gap: 8px; padding: 4px; border-radius: 6px; }
+.file-list li:hover { background: rgba(255, 255, 255, 0.04); }
 .link {
   font: inherit;
   font-family: ui-monospace, monospace;
@@ -594,33 +696,60 @@ h2 { font-size: 14px; margin: 0 0 8px; }
   background: none;
   border: none;
   padding: 0;
-  color: #0969da;
+  color: #9bbcff;
   cursor: pointer;
   text-align: left;
   word-break: break-all;
 }
-.link.selected { font-weight: 700; }
-.file-view { flex: 1; min-width: 0; }
-/* Phone width: sidebar above the main column. */
-@media (max-width: 720px) {
-  .layout { flex-direction: column; }
-  .sidebar { width: auto; max-height: 40vh; position: static; border-right: none; border-bottom: 1px solid #d0d7de; }
-  .files { flex-direction: column; }
-  .file-list { width: auto; }
-  .row { grid-template-columns: 56px 80px 1fr; }
-  .row .summary { grid-column: 1 / -1; }
-}
-
+.link.selected { font-weight: 700; color: #c4d7ff; }
+.file-view h2 { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
 .file-view pre {
   margin: 0;
   padding: 12px;
-  background: #fff;
-  border: 1px solid #d0d7de;
-  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 12px;
-  max-height: 60vh;
-  overflow: auto;
+  line-height: 1.5;
+  color: #d8dce6;
+}
+
+.composer { padding: 10px; border-top: 1px solid var(--border); background: rgba(0, 0, 0, 0.15); }
+.composer textarea {
+  width: 100%;
+  font: inherit;
+  padding: 10px 12px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  resize: none;
+  outline: none;
+}
+.composer textarea:focus { border-color: rgba(107, 156, 255, 0.6); }
+.composer textarea::placeholder { color: #6b7086; }
+.composer-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-top: 8px; }
+.composer button {
+  font: inherit;
+  font-weight: 600;
+  padding: 6px 18px;
+  border: none;
+  border-radius: 9px;
+  background: linear-gradient(145deg, #7aa7ff, #5a82e6);
+  color: #0d1020;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.composer button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Narrow screens: sidebar on top, office, then the panel below it. */
+@media (max-width: 900px) {
+  .layout { flex-direction: column; height: auto; min-height: 100vh; }
+  .sidebar { width: auto; max-height: 38vh; border-right: none; border-bottom: 1px solid var(--border); }
+  .stage { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .stage > .office { height: auto; aspect-ratio: 4 / 3; }
+  .panel { position: static; width: auto; height: 70vh; }
 }
 </style>
