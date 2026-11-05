@@ -1,12 +1,11 @@
 <script setup lang="ts">
-// 2D office: one character per agent, animated from the task's events.
+// Office: one robot per agent, animated from the task's events.
 // All state comes from utils/officeState.ts (pure reducer). This component
-// only feeds it events (live from the feed, or replayed from events.jsonl)
-// and draws the result on a plain Canvas 2D.
-import {
-  DOOR, WALK_MS, BUBBLE_MS, activeBubble, characterStatus, initialState, reduce, showsAlert, tick, walkProgress
-} from '~/utils/officeState'
-import type { Character, OfficeEvent, OfficeState } from '~/utils/officeState'
+// only feeds it events (live from the feed, or replayed from events.jsonl);
+// utils/officeScene.ts draws the result in 3D with three.js.
+import { WALK_MS, BUBBLE_MS, initialState, reduce, tick } from '~/utils/officeState'
+import type { OfficeEvent, OfficeState } from '~/utils/officeState'
+import type { OfficeScene } from '~/utils/officeScene'
 
 const props = defineProps<{
   taskId: string
@@ -15,60 +14,6 @@ const props = defineProps<{
 }>()
 
 const apiBase = useRuntimeConfig().public.apiBase as string
-
-// ---- Layout (canvas units) ----
-const W = 720
-const H = 360
-const CORRIDOR_Y = 170 // characters walk along this line between the rows
-const DESK_W = 90
-const DESK_H = 40
-const DESKS: Record<string, { x: number, y: number, label: string }> = {
-  'desk:orchestrator': { x: 140, y: 60, label: 'orchestrator' },
-  'desk:writer': { x: 360, y: 60, label: 'writer' },
-  'desk:reviewer': { x: 580, y: 60, label: 'reviewer' },
-  'spare:1': { x: 460, y: 240, label: 'spare' },
-  'spare:2': { x: 560, y: 240, label: 'spare' },
-  'spare:3': { x: 660, y: 240, label: 'spare' }
-}
-const TABLE = { x: 250, y: 290, rx: 80, ry: 30 }
-const DOOR_POINT = { x: 30, y: 260 }
-// Same colours as the agent tags in the feed.
-const COLOURS: Record<string, string> = { orchestrator: '#0550ae', writer: '#8250df', reviewer: '#bc4c00' }
-
-interface Point { x: number, y: number }
-
-// Where a character stands for a place: the door, the chair in front of a
-// desk, or a seat around the meeting table (table:<n>, 8 seats, then repeats).
-function placePoint(place: string): Point {
-  if (place === DOOR) return DOOR_POINT
-  const desk = DESKS[place]
-  if (desk) return { x: desk.x, y: desk.y + DESK_H / 2 + 26 }
-  const n = Number(place.split(':')[1]) || 1
-  const angle = -Math.PI / 2 + ((n - 1) % 8) * (Math.PI / 4)
-  return { x: TABLE.x + Math.cos(angle) * (TABLE.rx + 18), y: TABLE.y + Math.sin(angle) * (TABLE.ry + 18) }
-}
-
-// Position along a walk: up/down to the corridor, across, then to the target.
-function walkPoint(from: Point, to: Point, progress: number): Point {
-  const path = [from, { x: from.x, y: CORRIDOR_Y }, { x: to.x, y: CORRIDOR_Y }, to]
-  const lengths = path.slice(1).map((p, i) => Math.hypot(p.x - path[i]!.x, p.y - path[i]!.y))
-  let left = progress * lengths.reduce((a, b) => a + b, 0)
-  for (let i = 0; i < lengths.length; i++) {
-    const len = lengths[i]!
-    if (left <= len && len > 0) {
-      const a = path[i]!
-      const b = path[i + 1]!
-      return { x: a.x + (b.x - a.x) * (left / len), y: a.y + (b.y - a.y) * (left / len) }
-    }
-    left -= len
-  }
-  return to
-}
-
-function characterPoint(state: OfficeState, c: Character): Point {
-  if (!c.walk) return placePoint(c.desk)
-  return walkPoint(placePoint(c.walk.from), placePoint(c.walk.to), walkProgress(state, c.name))
-}
 
 // ---- Live: follow the feed ----
 let liveState = initialState()
@@ -147,148 +92,13 @@ function togglePlay() {
   else playing.value = !playing.value
 }
 
-// ---- Drawing ----
-const canvasEl = ref<HTMLCanvasElement | null>(null)
+// ---- Drawing (three.js, utils/officeScene.ts) ----
+const sceneEl = ref<HTMLDivElement | null>(null)
+const sceneError = ref<string | null>(null)
+let scene: OfficeScene | null = null
 let frame = 0
 let lastFrameMs = 0
-
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-  ctx.beginPath()
-  ctx.roundRect(x, y, w, h, r)
-}
-
-function drawRoom(ctx: CanvasRenderingContext2D) {
-  ctx.fillStyle = '#f3efe6'
-  ctx.fillRect(0, 0, W, H)
-  ctx.strokeStyle = '#8c959f'
-  ctx.lineWidth = 6
-  ctx.strokeRect(3, 3, W - 6, H - 6)
-  // Door: a gap in the left wall.
-  ctx.fillStyle = '#a0784a'
-  ctx.fillRect(0, DOOR_POINT.y - 34, 10, 68)
-  ctx.fillStyle = '#57606a'
-  ctx.font = '10px ui-monospace, monospace'
-  ctx.textAlign = 'left'
-  ctx.fillText('door', 14, DOOR_POINT.y - 38)
-  // Meeting table.
-  ctx.fillStyle = '#c9b48a'
-  ctx.beginPath()
-  ctx.ellipse(TABLE.x, TABLE.y, TABLE.rx, TABLE.ry, 0, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.fillStyle = '#6e5a36'
-  ctx.textAlign = 'center'
-  ctx.fillText('meeting table', TABLE.x, TABLE.y + 4)
-}
-
-function drawDesk(ctx: CanvasRenderingContext2D, place: string, busy: boolean, now: number) {
-  const desk = DESKS[place]!
-  const x = desk.x - DESK_W / 2
-  const y = desk.y - DESK_H / 2
-  ctx.fillStyle = '#b08a5a'
-  roundRect(ctx, x, y, DESK_W, DESK_H, 4)
-  ctx.fill()
-  // Monitor; its screen flickers while the owner is working.
-  ctx.fillStyle = '#24292f'
-  ctx.fillRect(desk.x - 18, y + 4, 36, 20)
-  ctx.fillStyle = busy && Math.floor(now / 200) % 2 === 0 ? '#7ee2a8' : '#57606a'
-  ctx.fillRect(desk.x - 15, y + 7, 30, 14)
-  ctx.fillStyle = '#4b3a24'
-  ctx.font = '10px ui-monospace, monospace'
-  ctx.textAlign = 'center'
-  ctx.fillText(desk.label, desk.x, y + DESK_H - 5)
-}
-
-function drawCharacter(ctx: CanvasRenderingContext2D, state: OfficeState, c: Character, now: number) {
-  const status = characterStatus(state, c.name)
-  const p = characterPoint(state, c)
-  const bob = status === 'walking' ? Math.sin(now / 70) * 2 : 0
-  const x = p.x
-  const y = p.y + bob
-  const colour = COLOURS[c.name] ?? '#6e7781'
-  // Body and head.
-  ctx.fillStyle = colour
-  roundRect(ctx, x - 10, y - 10, 20, 22, 6)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.arc(x, y - 18, 9, 0, Math.PI * 2)
-  ctx.fillStyle = '#f2d3b1'
-  ctx.fill()
-  ctx.strokeStyle = colour
-  ctx.lineWidth = 2
-  ctx.stroke()
-  // Typing: hands going up and down.
-  if (status === 'working') {
-    const up = Math.floor(now / 120) % 2 === 0
-    ctx.fillStyle = '#f2d3b1'
-    ctx.beginPath()
-    ctx.arc(x - 7, y - 8 - (up ? 3 : 0), 3, 0, Math.PI * 2)
-    ctx.arc(x + 7, y - 8 - (up ? 0 : 3), 3, 0, Math.PI * 2)
-    ctx.fill()
-  }
-  ctx.textAlign = 'center'
-  ctx.fillStyle = '#1f2328'
-  ctx.font = '11px ui-monospace, monospace'
-  ctx.fillText(c.name, x, y + 24)
-  ctx.fillStyle = '#6e7781'
-  ctx.font = '10px ui-monospace, monospace'
-  ctx.fillText(status, x, y + 35)
-}
-
-function drawOverlays(ctx: CanvasRenderingContext2D, state: OfficeState, c: Character) {
-  const p = characterPoint(state, c)
-  const bubble = activeBubble(state, c.name)
-  if (bubble !== null) {
-    ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif'
-    const w = Math.min(W - 8, ctx.measureText(bubble).width + 14)
-    const bx = Math.min(Math.max(4, p.x - w / 2), W - w - 4)
-    const by = p.y - 58
-    ctx.fillStyle = '#ffffff'
-    ctx.strokeStyle = '#57606a'
-    ctx.lineWidth = 1
-    roundRect(ctx, bx, by, w, 20, 6)
-    ctx.fill()
-    ctx.stroke()
-    ctx.beginPath()
-    ctx.moveTo(p.x - 5, by + 20)
-    ctx.lineTo(p.x, by + 27)
-    ctx.lineTo(p.x + 5, by + 20)
-    ctx.fill()
-    ctx.fillStyle = '#1f2328'
-    ctx.textAlign = 'left'
-    ctx.fillText(bubble, bx + 7, by + 14)
-  }
-  if (showsAlert(state, c.name)) {
-    ctx.font = 'bold 22px -apple-system, BlinkMacSystemFont, sans-serif'
-    ctx.textAlign = 'center'
-    ctx.lineWidth = 3
-    ctx.strokeStyle = '#ffffff'
-    ctx.strokeText('!', p.x + 16, p.y - 26)
-    ctx.fillStyle = '#cf222e'
-    ctx.fillText('!', p.x + 16, p.y - 26)
-  }
-}
-
-function draw(state: OfficeState, now: number) {
-  const canvas = canvasEl.value
-  const ctx = canvas?.getContext('2d')
-  if (!canvas || !ctx) return
-  const dpr = window.devicePixelRatio || 1
-  if (canvas.width !== W * dpr) {
-    canvas.width = W * dpr
-    canvas.height = H * dpr
-  }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  drawRoom(ctx)
-  const visible = Object.values(state.characters).filter(c => c.present)
-  for (const place of Object.keys(DESKS)) {
-    const owner = visible.find(c => c.desk === place && !c.walk)
-    drawDesk(ctx, place, !!owner && characterStatus(state, owner.name) === 'working', now)
-  }
-  // Lower characters drawn last so they overlap the ones behind them.
-  visible.sort((a, b) => characterPoint(state, a).y - characterPoint(state, b).y)
-  for (const c of visible) drawCharacter(ctx, state, c, now)
-  for (const c of visible) drawOverlays(ctx, state, c)
-}
+let unmounted = false
 
 function loop(frameMs: number) {
   // Clamp: a hidden tab gets no frames, and replay should not jump ahead when
@@ -303,16 +113,30 @@ function loop(frameMs: number) {
     if (Number.isFinite(clockOffset)) liveState = tick(liveState, Date.now() + clockOffset)
     state = liveState
   }
-  draw(state, frameMs)
+  scene?.draw(state, frameMs)
   frame = requestAnimationFrame(loop)
 }
 
-onMounted(() => {
+onMounted(async () => {
   feedLive()
+  // Loaded here so three.js only runs in the browser (never during SSR).
+  const { createOfficeScene } = await import('~/utils/officeScene')
+  if (unmounted || !sceneEl.value) return
+  try {
+    scene = createOfficeScene(sceneEl.value)
+  } catch (err) {
+    sceneError.value = `3D view unavailable (WebGL): ${(err as Error)?.message ?? err}`
+    return
+  }
   frame = requestAnimationFrame(loop)
 })
 
-onBeforeUnmount(() => cancelAnimationFrame(frame))
+onBeforeUnmount(() => {
+  unmounted = true
+  cancelAnimationFrame(frame)
+  scene?.dispose()
+  scene = null
+})
 </script>
 
 <template>
@@ -338,7 +162,9 @@ onBeforeUnmount(() => cancelAnimationFrame(frame))
       </template>
       <span v-if="replayError" class="error">{{ replayError }}</span>
     </div>
-    <canvas ref="canvasEl" class="office-canvas" :width="W" :height="H" />
+    <div ref="sceneEl" class="office-scene">
+      <p v-if="sceneError" class="scene-error">{{ sceneError }}</p>
+    </div>
   </div>
 </template>
 
@@ -355,12 +181,79 @@ onBeforeUnmount(() => cancelAnimationFrame(frame))
 }
 .office-bar button:disabled { color: #8c959f; cursor: not-allowed; }
 .office-bar button.active { background: #ddf4ff; border-color: #54aeff; }
-.office-canvas {
-  display: block;
+.office-scene {
+  position: relative;
   width: 100%;
-  max-width: 720px;
-  aspect-ratio: 2 / 1;
-  border: 1px solid #d0d7de;
-  border-radius: 6px;
+  aspect-ratio: 16 / 9;
+  max-height: 64vh;
+  overflow: hidden;
+  border-radius: 12px;
+  background:
+    radial-gradient(ellipse at 50% 35%, #3a3a6a 0%, #1e1d3a 55%, #12111f 100%);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(20, 18, 40, 0.25);
+}
+.scene-error { color: #ffb4a8; padding: 12px; margin: 0; font-size: 13px; }
+</style>
+
+<style>
+/* Elements created by utils/officeScene.ts (not scoped: they are made in JS). */
+.office3d-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.office3d-labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.office3d-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.office3d-tag {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px 2px 6px;
+  border-radius: 999px;
+  background: rgba(22, 20, 38, 0.82);
+  color: #f1f3f8;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+.office3d-dot { width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.25); }
+.office3d-status { font-weight: 400; color: #a9adc6; }
+.office3d-tag[data-status="working"] .office3d-status { color: #7ee2a8; }
+.office3d-tag[data-status="talking"] .office3d-status { color: #79c0ff; }
+.office3d-tag[data-status="walking"] .office3d-status { color: #f2cc60; }
+.office3d-bubble {
+  position: relative;
+  max-width: 220px;
+  padding: 5px 10px;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #1f2328;
+  font-size: 12px;
+  line-height: 1.3;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+.office3d-bubble::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 10px;
+  height: 10px;
+  background: #ffffff;
+  transform: translateX(-50%) rotate(45deg);
+}
+.office3d-bubble[hidden] { display: none; }
+.office3d-alert {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #cf222e;
+  color: #fff;
+  font: 700 15px/22px -apple-system, BlinkMacSystemFont, sans-serif;
+  text-align: center;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.85), 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 </style>
