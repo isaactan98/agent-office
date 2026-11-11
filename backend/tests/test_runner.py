@@ -163,6 +163,14 @@ def test_build_options_isolation(task_dir, emitter) -> None:
     assert options.agents["reviewer"].tools == ["Read", "Glob", "Grep", "Write"]
 
 
+def test_build_options_models(task_dir, emitter) -> None:
+    """Orchestrator on Sonnet, subagents on Haiku (not the CLI default, Opus)."""
+    options = runner.build_options(task_dir, emitter)
+    assert options.model == "sonnet"
+    assert options.agents["writer"].model == "haiku"
+    assert options.agents["reviewer"].model == "haiku"
+
+
 def test_orchestrator_prompt_is_short() -> None:
     assert len(agents.ORCHESTRATOR_PROMPT.splitlines()) < 40
 
@@ -568,7 +576,7 @@ def test_cancel_running_task_interrupts_session(tasks_dir, fake_sdk, no_api_key)
     assert manifest["status"] == "cancelled" and manifest["error"] is None
     types = [(e["type"], e["summary"]) for e in logged(tasks_dir / task_id)]
     assert types == [("task_started", "Task started"), ("agent_message", "Working on it"),
-                     ("task_failed", "Task cancelled")]
+                     ("task_cancelled", "Task cancelled")]
     [entry] = usage.read_entries()
     assert entry["status"] == "cancelled" and entry["usage"] == {"input_tokens": 3}
     assert runner._cancel_requested == set() and runner._clients == {}
@@ -586,7 +594,8 @@ def test_cancel_before_start(tasks_dir, fake_sdk, no_api_key) -> None:
     manifest = tasks.read_manifest(task_id)
     assert manifest["status"] == "cancelled" and manifest["started_at"] is None
     assert fake.instances == []
-    assert [e["summary"] for e in logged(tasks_dir / task_id)] == ["Task cancelled before it started"]
+    assert [(e["type"], e["summary"]) for e in logged(tasks_dir / task_id)] == [
+        ("task_cancelled", "Task cancelled before it started")]
 
 
 def test_cancel_while_connecting_skips_prompt(tasks_dir, fake_sdk, no_api_key) -> None:
@@ -623,7 +632,7 @@ def test_asyncio_cancel_marks_cancelled(tasks_dir, fake_sdk, no_api_key) -> None
 
     asyncio.run(scenario())
     assert tasks.read_manifest(task_id)["status"] == "cancelled"
-    assert [e["type"] for e in logged(tasks_dir / task_id)][-1] == "task_failed"
+    assert [e["type"] for e in logged(tasks_dir / task_id)][-1] == "task_cancelled"
     assert runner._clients == {}
 
 

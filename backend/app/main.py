@@ -19,7 +19,38 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.check_no_api_key()  # raising here stops uvicorn before it serves anything
+    recover_tasks()
     yield
+
+
+def recover_tasks() -> None:
+    """Pick up tasks left over from before a restart (the queue lives in memory).
+
+    'queued' tasks go back in the queue, oldest first. 'running' tasks cannot be
+    resumed (their SDK session died with the old process): they become 'failed'
+    with error "Server restarted" and get a task_failed event.
+    """
+    global _worker
+    queued = []
+    for manifest in tasks.list_manifests():
+        task_id = manifest["task_id"]
+        try:
+            if manifest["status"] == "queued" and task_id not in _pending:
+                queued.append(manifest)
+            elif manifest["status"] == "running" and not _is_running(task_id):
+                directory = tasks.task_dir(task_id)
+                last_seq = max((e["seq"] for e in events.read_events(directory)), default=0)
+                tasks.set_status(task_id, "failed", error=SERVER_RESTARTED)
+                emitter = events.EventEmitter(task_id, directory, last_seq=last_seq)
+                runner.emit_safely(emitter, "task_failed", f"Task failed: {SERVER_RESTARTED}")
+                log.info("marked stale running task %s as failed", task_id)
+        except Exception:
+            log.exception("could not recover task %s", task_id)  # skip it, recover the rest
+    for manifest in sorted(queued, key=lambda m: (m["created_at"], m["task_id"])):
+        _pending.append(manifest["task_id"])
+        log.info("re-queued task %s", manifest["task_id"])
+    if _pending and (_worker is None or _worker.done()):
+        _worker = asyncio.create_task(_work())
 
 
 app = FastAPI(title="agent-office", lifespan=lifespan)
@@ -32,7 +63,8 @@ app.add_middleware(
 
 # Files bigger than this are not served by GET /tasks/{id}/files/{path}.
 MAX_FILE_BYTES = 1024 * 1024
-TERMINAL_EVENTS = {"task_done", "task_failed"}
+TERMINAL_EVENTS = {"task_done", "task_failed", "task_cancelled"}
+SERVER_RESTARTED = "Server restarted"
 # How often the WebSocket re-checks whether its task is still running.
 WS_POLL_SECONDS = 1.0
 
@@ -206,7 +238,7 @@ def get_task_file(task_id: str, file_path: str) -> str:
 @app.websocket("/ws/tasks/{task_id}")
 async def task_events_ws(websocket: WebSocket, task_id: str) -> None:
     """Send the task's past events, then new ones as they happen. Closes after
-    task_done/task_failed, or once the task is neither running nor queued and
+    task_done/task_failed/task_cancelled, or once the task is neither running nor queued and
     nothing is left."""
     # Browsers do not apply CORS to WebSockets, so check the origin here.
     # No Origin header means a non-browser client (curl, tests): allowed.

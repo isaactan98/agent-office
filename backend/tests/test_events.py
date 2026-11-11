@@ -70,6 +70,14 @@ def test_seq_strictly_increasing(emitter) -> None:
     assert seqs == [1, 2, 3, 4, 5]
 
 
+def test_emitter_continues_after_last_seq(emitter, task_dir) -> None:
+    emitter.emit("task_started", "Task started")
+    emitter.emit("agent_message", "hi")
+    later = events.EventEmitter(TASK_ID, task_dir, last_seq=2)
+    assert later.emit("task_cancelled", "Task cancelled").seq == 3
+    assert len(events.validate_file(task_dir / "events.jsonl")) == 3
+
+
 def test_appends_one_json_line_per_event(emitter, task_dir) -> None:
     first = emitter.emit("task_started", "Task started")
     second = emitter.emit("tool_start", "Write output/a.md", tool="Write", path="output/a.md")

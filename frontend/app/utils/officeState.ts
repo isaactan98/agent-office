@@ -17,7 +17,7 @@ export interface OfficeEvent {
 }
 
 export type CharacterStatus = 'idle' | 'walking' | 'working' | 'talking'
-export type TaskStatus = 'none' | 'queued' | 'running' | 'done' | 'failed'
+export type TaskStatus = 'none' | 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
 
 // A place is 'door', 'desk:<agent>', 'spare:<n>' or 'table:<n>'.
 // Office.vue maps places to canvas coordinates.
@@ -62,7 +62,8 @@ const TASK_TYPES: Record<string, TaskStatus> = {
   task_queued: 'queued',
   task_started: 'running',
   task_done: 'done',
-  task_failed: 'failed'
+  task_failed: 'failed',
+  task_cancelled: 'cancelled'
 }
 const AGENT_TYPES = new Set([
   'agent_message', 'tool_start', 'tool_end', 'tool_denied', 'subagent_start', 'subagent_stop'
@@ -134,7 +135,7 @@ export function reduce(state: OfficeState, event: OfficeEvent): OfficeState {
 
   if (taskStatus) {
     const characters: Record<string, Character> = { ...next.characters }
-    if (type === 'task_done' || type === 'task_failed') {
+    if (type === 'task_done' || type === 'task_failed' || type === 'task_cancelled') {
       // Nothing is running any more: nobody stays at the keyboard.
       for (const name of Object.keys(characters)) {
         characters[name] = { ...characters[name]!, openTools: 0, workUntilMs: 0 }

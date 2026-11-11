@@ -34,6 +34,7 @@ EventType = Literal[
     "subagent_stop",
     "task_done",
     "task_failed",
+    "task_cancelled",
 ]
 
 
@@ -123,10 +124,12 @@ def publish(event: Event) -> None:
 class EventEmitter:
     """Numbers, stores and publishes the events of one task run."""
 
-    def __init__(self, task_id: str, task_dir: Path) -> None:
+    def __init__(self, task_id: str, task_dir: Path, last_seq: int = 0) -> None:
+        """`last_seq`: the seq of the last event already in events.jsonl, so new
+        events continue after it (0 for a task with no events yet)."""
         self.task_id = task_id
         self.file = task_dir / "events.jsonl"
-        self._seq = 0
+        self._seq = last_seq
 
     def emit(
         self,

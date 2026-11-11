@@ -70,6 +70,11 @@ The phone cannot reach `127.0.0.1` on the Mac, so both servers go through
 | `https://<mac>.<tailnet>.ts.net` (port 443) | frontend `http://127.0.0.1:3000` |
 | `https://<mac>.<tailnet>.ts.net:8443` | backend `http://127.0.0.1:8000` |
 
+The Mac app install does not put the `tailscale` command on `PATH`. Either run
+it by its full path, `/Applications/Tailscale.app/Contents/MacOS/Tailscale`,
+or add an alias in your shell profile:
+`alias tailscale=/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
+
 Find the name with `tailscale status` (or the admin console → Machines). Below,
 `MAC=<mac>.<tailnet>.ts.net`.
 
@@ -113,8 +118,10 @@ config across reboots until it is turned off.
 
 ## Leaving it running
 - One task runs at a time. A task sent while another runs gets status `queued`
-  and starts when the earlier ones finish (FIFO). Queued tasks live in memory:
-  after a backend restart they stay `queued` until cancelled with the Cancel button.
+  and starts when the earlier ones finish (FIFO). The queue lives in memory, so
+  on startup the backend re-queues every `queued` task (oldest first) and marks
+  every task left `running` as `failed` with error "Server restarted" (its
+  session died with the old process).
 - Cancel (button, or `POST /tasks/{id}/cancel`) works for queued and running
   tasks. A running task is stopped with the SDK's interrupt; if it has not
   stopped after 15 s, its asyncio task is cancelled.

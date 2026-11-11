@@ -2,7 +2,7 @@
 
 SDK names checked against the installed claude-agent-sdk 0.2.177 (types.py):
 `ClaudeAgentOptions.agents` is `dict[str, AgentDefinition]`; `AgentDefinition` has
-`description`, `prompt`, `tools`, `maxTurns`. The orchestrator starts a subagent with
+`description`, `prompt`, `tools`, `model`, `maxTurns`. The orchestrator starts a subagent with
 the CLI's `Agent` tool, whose input keys (checked in the bundled CLI) are
 `description`, `prompt`, `subagent_type` and `run_in_background` (plus team/
 isolation/model options we refuse). Agents run in the background unless
@@ -19,6 +19,12 @@ DELEGATION_TOOL = "Agent"
 DELEGATION_KEYS = {"description", "prompt", "subagent_type", "run_in_background"}
 MAX_SUBAGENT_CALLS = 4
 REVIEW_FILE = "output/review.md"  # the only file the reviewer may write
+
+# Model aliases (AgentDefinition.model accepts "sonnet", "opus", "haiku", "inherit"
+# or a full ID). Aliases follow the newest model of each family. The orchestrator's
+# model goes on ClaudeAgentOptions.model in runner.build_options.
+ORCHESTRATOR_MODEL = "sonnet"
+SUBAGENT_MODEL = "haiku"
 
 ORCHESTRATOR_PROMPT = """\
 You are the orchestrator of a small team. You plan and delegate; you do not write
@@ -72,6 +78,7 @@ SUBAGENTS: dict[str, AgentDefinition] = {
         description="Writes and fixes the deliverable files under output/.",
         prompt=WRITER_PROMPT,
         tools=["Read", "Write", "Edit"],
+        model=SUBAGENT_MODEL,
         maxTurns=10,
     ),
     REVIEWER: AgentDefinition(
@@ -79,6 +86,7 @@ SUBAGENTS: dict[str, AgentDefinition] = {
         prompt=REVIEWER_PROMPT,
         # Write is needed for review.md; the path guard allows no other file.
         tools=["Read", "Glob", "Grep", "Write"],
+        model=SUBAGENT_MODEL,
         maxTurns=8,
     ),
 }

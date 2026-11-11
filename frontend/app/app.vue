@@ -46,9 +46,10 @@ interface Usage {
 
 const KNOWN_TYPES = new Set([
   'task_queued', 'task_started', 'agent_message', 'tool_start', 'tool_end',
-  'tool_denied', 'subagent_start', 'subagent_stop', 'task_done', 'task_failed'
+  'tool_denied', 'subagent_start', 'subagent_stop', 'task_done', 'task_failed',
+  'task_cancelled'
 ])
-const TERMINAL_TYPES = new Set(['task_done', 'task_failed'])
+const TERMINAL_TYPES = new Set(['task_done', 'task_failed', 'task_cancelled'])
 // Agents defined in backend/app/agents.py. Any other name gets the grey tag.
 const AGENTS = ['orchestrator', 'writer', 'reviewer']
 
@@ -151,7 +152,7 @@ function closeSocket() {
 }
 
 // Open the task's WebSocket. The server sends every past event first, then
-// live ones, and closes after task_done / task_failed.
+// live ones, and closes after task_done / task_failed / task_cancelled.
 function connect(taskId: string) {
   closeSocket()
   connection.value = 'connecting'
@@ -669,6 +670,7 @@ h2 { font-size: 13px; margin: 0 0 8px; }
 .t-subagent_start, .t-subagent_stop { border-left-color: #39c5cf; }
 .t-task_done { border-left-color: var(--green); background: rgba(63, 220, 106, 0.07); }
 .t-task_failed { border-left-color: var(--red); background: rgba(255, 123, 114, 0.1); }
+.t-task_cancelled { border-left-color: #6b7086; background: rgba(255, 255, 255, 0.04); }
 .t-unknown { border-left-color: #6b7086; font-style: italic; }
 .t-unknown .summary { color: var(--muted); }
 

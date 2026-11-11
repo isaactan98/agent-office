@@ -150,6 +150,20 @@ test('task_done and task_failed: task status set, nobody keeps working', () => {
   }
 })
 
+test('task_cancelled: task status cancelled, nobody keeps working', () => {
+  const s = run([ev(0, 'task_started'), ev(5, 'tool_start'), ev(10, 'task_cancelled')])
+  assert.equal(s.task, 'cancelled')
+  assert.equal(s.characters.orchestrator!.openTools, 0)
+  assert.equal(characterStatus(s, 'orchestrator'), 'idle')
+})
+
+test('old replay: task_failed "Task cancelled" still ends the task', () => {
+  // events.jsonl files written before task_cancelled existed
+  const s = run([ev(0, 'task_started'), ev(5, 'tool_start'), ev(10, 'task_failed', 'orchestrator', { summary: 'Task cancelled' })])
+  assert.equal(s.task, 'failed')
+  assert.equal(characterStatus(s, 'orchestrator'), 'idle')
+})
+
 test('unknown event type is ignored (same state object)', () => {
   const s = run([ev(0, 'task_started')])
   assert.equal(reduce(s, ev(99_000, 'something_new', 'writer')), s)

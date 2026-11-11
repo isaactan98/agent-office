@@ -14,7 +14,8 @@ from app import config, events, main, runner, tasks, usage
 
 
 @pytest.fixture
-def client(tasks_dir, monkeypatch):
+def run_calls(tasks_dir, monkeypatch):
+    """Fresh queue state and a fake run_task; returns the task_ids it was called with."""
     calls = []
 
     async def fake_run_task(task_id: str) -> None:
@@ -25,8 +26,13 @@ def client(tasks_dir, monkeypatch):
     monkeypatch.setattr(main, "_worker", None)
     monkeypatch.setattr(main, "_pending", deque())
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    return calls
+
+
+@pytest.fixture
+def client(run_calls):
     with TestClient(main.app) as c:
-        c.calls = calls
+        c.calls = run_calls
         yield c
 
 
@@ -326,7 +332,7 @@ def test_cancel_queued_task(client, gated, tasks_dir) -> None:
     assert response.json() == {"task_id": second, "status": "cancelled"}
     manifest = tasks.read_manifest(second)
     assert manifest["status"] == "cancelled" and manifest["started_at"] is None
-    assert [e["type"] for e in events.read_events(tasks_dir / second)] == ["task_failed"]
+    assert [e["type"] for e in events.read_events(tasks_dir / second)] == ["task_cancelled"]
     gated.open = True
     wait_until(lambda: status_of(client, first) == "done")
     time.sleep(0.1)
@@ -366,7 +372,8 @@ def test_cancel_running_task_interrupts(client, real_runner, fake_sdk, tasks_dir
     response = client.post(f"/tasks/{task_id}/cancel")
     assert response.json() == {"task_id": task_id, "status": "cancelled"}
     assert fake.instances[0].interrupted.is_set()
-    assert events.read_events(tasks_dir / task_id)[-1]["summary"] == "Task cancelled"
+    last = events.read_events(tasks_dir / task_id)[-1]
+    assert (last["type"], last["summary"]) == ("task_cancelled", "Task cancelled")
     assert [e["status"] for e in usage.read_entries()] == ["cancelled"]
 
 
@@ -415,7 +422,7 @@ def test_ws_for_queued_task_stays_open_until_cancelled(client, gated) -> None:
         client.post(f"/tasks/{second}/cancel")
         received = _receive_all(ws)
     assert [(e["type"], e["summary"]) for e in received] == [
-        ("task_failed", "Task cancelled before it started")]
+        ("task_cancelled", "Task cancelled before it started")]
     gated.open = True
 
 
@@ -529,6 +536,55 @@ def test_startup_error_does_not_print_the_key(tasks_dir, monkeypatch) -> None:
         with TestClient(main.app):
             pass
     assert "sk-should-never-appear" not in str(info.value)
+
+
+def _set_created_at(task_id: str, created_at: str) -> None:
+    manifest = tasks.read_manifest(task_id)
+    manifest["created_at"] = created_at
+    tasks._write_manifest(tasks.task_dir(task_id), manifest)
+
+
+def test_startup_requeues_queued_tasks_oldest_first(run_calls) -> None:
+    newer = tasks.create_task("newer")["task_id"]
+    older = tasks.create_task("older")["task_id"]
+    _set_created_at(newer, "2026-11-12T10:00:02.000+08:00")
+    _set_created_at(older, "2026-11-12T10:00:01.000+08:00")
+    done = tasks.create_task("finished")["task_id"]
+    tasks.set_status(done, "running")
+    tasks.set_status(done, "done")
+    with TestClient(main.app):
+        wait_until(lambda: len(run_calls) == 2)
+    assert run_calls == [older, newer]  # the finished task is not run again
+    assert tasks.read_manifest(done)["status"] == "done"
+
+
+def test_startup_fails_stale_running_task(run_calls, tasks_dir) -> None:
+    task_id = tasks.create_task("was running")["task_id"]
+    tasks.set_status(task_id, "running")
+    emitter = events.EventEmitter(task_id, tasks_dir / task_id)
+    emitter.emit("task_started", "Task started")
+    emitter.emit("agent_message", "Working on it")
+    with TestClient(main.app) as c:
+        manifest = c.get(f"/tasks/{task_id}").json()
+        assert c.post(f"/tasks/{task_id}/cancel").status_code == 409  # already ended
+    assert manifest["status"] == "failed"
+    assert manifest["error"] == "Server restarted" and manifest["finished_at"] is not None
+    logged = events.read_events(tasks_dir / task_id)
+    assert [(e["seq"], e["type"]) for e in logged] == [
+        (1, "task_started"), (2, "agent_message"), (3, "task_failed")]
+    assert logged[-1]["summary"] == "Task failed: Server restarted"
+    events.validate_file(tasks_dir / task_id / "events.jsonl")
+    assert run_calls == []
+
+
+def test_startup_recovery_skips_a_broken_task(run_calls, tasks_dir) -> None:
+    broken = tasks.create_task("broken")["task_id"]
+    tasks.set_status(broken, "running")
+    (tasks_dir / broken / "events.jsonl").write_text("not json\n")
+    queued = tasks.create_task("queued")["task_id"]
+    with TestClient(main.app):
+        wait_until(lambda: run_calls == [queued])
+    assert tasks.read_manifest(broken)["status"] == "running"  # left alone, logged
 
 
 # --- traversal: every endpoint that takes a task_id or path ----------------

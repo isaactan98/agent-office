@@ -272,6 +272,7 @@ def build_options(task_dir: Path, emitter: events.EventEmitter) -> ClaudeAgentOp
     return ClaudeAgentOptions(
         cwd=task_dir,
         system_prompt=agents.ORCHESTRATOR_PROMPT,
+        model=agents.ORCHESTRATOR_MODEL,
         agents=agents.SUBAGENTS,
         tools=SESSION_TOOLS,  # the only built-in tools that exist in the session
         allowed_tools=SESSION_TOOLS,  # auto-approve them
@@ -296,12 +297,11 @@ def build_options(task_dir: Path, emitter: events.EventEmitter) -> ClaudeAgentOp
 
 
 def cancel_queued(task_id: str) -> dict[str, Any]:
-    """Mark a task that never started as cancelled. Emits task_failed so a watching
-    feed knows it ended (the event schema has no task_cancelled type)."""
+    """Mark a task that never started as cancelled and emit task_cancelled."""
     _cancel_requested.discard(task_id)
     manifest = tasks.set_status(task_id, "cancelled")
     emitter = events.EventEmitter(task_id, tasks.task_dir(task_id))
-    emit_safely(emitter, "task_failed", "Task cancelled before it started")
+    emit_safely(emitter, "task_cancelled", "Task cancelled before it started")
     return manifest
 
 
@@ -323,15 +323,15 @@ def _end_cancelled(task_id: str, emitter: events.EventEmitter) -> None:
         tasks.set_status(task_id, "cancelled")
     except Exception:
         log.exception("could not mark %s cancelled", task_id)
-    emit_safely(emitter, "task_failed", "Task cancelled")
+    emit_safely(emitter, "task_cancelled", "Task cancelled")
 
 
 async def run_task(task_id: str) -> None:
     """Run the task. Ends with status 'done' (summary.md written), 'failed' or
     'cancelled'. If the SDK returned a result, one line goes to usage.jsonl.
 
-    Events go to events.jsonl: task_started first, task_done or task_failed last
-    (a cancelled task ends with task_failed "Task cancelled").
+    Events go to events.jsonl: task_started first, task_done, task_failed or
+    task_cancelled last.
     """
     if task_id in _cancel_requested:  # cancelled before it started
         cancel_queued(task_id)
