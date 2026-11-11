@@ -3,12 +3,81 @@
 Newest entry on top. Updated at the end of each session (`prompts/session-end.md`).
 
 ## Current state
-- Phase: 8 done (3D office + office-first UI; asked in chat, no prompt file)
+- Phase: 9 done (`prompts/09-cleanup.md`: pinned models, restart recovery,
+  `task_cancelled`, config/docs gaps, live path-guard proof)
 - Machine last used: M3 MacBook Air (SG)
-- Blockers: none. `npm test` → 20 passed; `npm run build` → build complete.
-  Backend untouched this session (`uv run pytest` not re-run).
+- Blockers: none. `uv run pytest` → 247 passed; `npm test` → 22 passed;
+  `npm run build` → build complete.
 
 ## Log
+
+### 2026-11-11/12 — SG — M3 MacBook Air (session 10)
+- Done: (1) Checked Phase 8 in the running app (step 1 of the plan made in
+  chat). (2) Settled the open questions in chat; wrote
+  `prompts/09-cleanup.md`. (3) Phase 9:
+  - Models: orchestrator `sonnet` (`ClaudeAgentOptions.model`), writer and
+    reviewer `haiku` (`AgentDefinition.model`); aliases, constants in
+    `app/agents.py`. Field names checked in the installed `types.py`.
+  - Restart recovery (`recover_tasks` in `app/main.py`, run from `lifespan`):
+    `queued` manifests re-queued oldest first (`created_at`); leftover
+    `running` → `failed`, error "Server restarted", plus a `task_failed`
+    event continuing the file's `seq` (`EventEmitter(..., last_seq=)`). A task
+    that can't be recovered is logged and skipped.
+  - New event `task_cancelled` (queued and running cancels) replaces
+    `task_failed` "Task cancelled". Backend `TERMINAL_EVENTS`, frontend
+    `KNOWN_TYPES`/`TERMINAL_TYPES`, grey feed style, `officeState.ts` status
+    `cancelled`. Old files still replay (as `failed`).
+  - `.env.example`: `DAILY_TASK_CAP`, `FRONTEND_ORIGIN`. `@types/three`
+    0.186.0 as exact devDependency (published 2026-09-11; pulls 7 type-only
+    packages: @dimforge/rapier3d-compat, @tweenjs/tween.js, @types/stats.js,
+    @types/webxr, fflate, meshoptimizer).
+  - Docs: PLAN.md (`task_cancelled`, manifest `agents` shape, `tool` may be
+    `null`, Phase 8/9 rows), RUNNING.md (restart behaviour, `tailscale` CLI is
+    `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, not on PATH),
+    `prompts/08-office-3d.md` written after the fact.
+  Committed as 2298db0 (not pushed).
+- Verified by:
+  - Before changes: `uv run pytest` → 242 passed, `npm test` → 20 passed. In
+    the in-app browser against my running servers: live task
+    `20261111-235300-write-output-coffee-md-a-5-lin` (done, 5-line
+    `output/coffee.md`, 21 events) with office statuses matching the feed;
+    robot face seen up close after rotating the camera; 60 fps measured with
+    the pane visible, 1 canvas, no console errors; usage panel updated live;
+    Cancel worked on a queued task (`started_at: null`) and a running one
+    (stopped ~8 s after start, no output files).
+  - After changes: `uv run pytest` → 247 passed (5 new: models, re-queue
+    order, stale running → failed with seq 3, broken task skipped, emitter
+    `last_seq`); `npm test` → 22 passed (2 new); `npm run build` → build
+    complete.
+  - Backend restarted by Claude Code (with my OK) via `env -i` with HOME,
+    USER, LOGNAME, PATH: PID 72955 on 127.0.0.1:8000 only, no `ANTHROPIC*` /
+    `CLAUDE*` names in its env. No task was queued/running, so recovery
+    changed nothing.
+  - Browser: cancelling a queued task → feed `task_cancelled` "Task cancelled
+    before it started", grey, `feed: closed`.
+  - Run 1 (`20261112-003034-sandbox-test-of-the-path-guard`): writer refused
+    to attempt `../escape.md`; no `tool_denied`, hook not exercised.
+    `model_usage` → `claude-haiku-5-5`, `claude-sonnet-5-5`.
+  - Run 2, approved by me (`20261112-003249-authorized-test-of-the-sandbox`):
+    event 2 `tool_denied` Read "path '/Users/isaactan/Projects/agent-office/README.md'
+    is outside the task directory"; task `done`; `find -newer` → only that
+    task's files and `tasks/usage.jsonl`; `model_usage` → haiku + sonnet, no
+    Opus. Est. cost ~$0.02 per run.
+- Notes: 2 real runs instead of the prompt's 1 (second approved in chat).
+  Haiku appears in `model_usage` even when no subagent runs (probably the
+  CLI's own small calls; unverified). The 2298db0 commit message still says
+  the path guard is unproven (run 2 came after it). Tasks cancelled while
+  queued don't count toward the daily cap. At ~1024 px wide the chat panel
+  covers most of the office; scroll-zoom barely works while it is open.
+  Phone over Tailscale: still unverified (not run). The backend is running
+  in the background from Claude Code's restart, not in my terminal.
+- Next: phone check over the tailnet per `docs/RUNNING.md` (I run the
+  `tailscale serve` commands); then choose Phase 10 work (step 3 of the plan:
+  more agents, task history, Mac mini service, or Bash/web tools — the last
+  needs my approval and its own sandbox design).
+- Open questions: should the office get more room at ~1024 px (narrower or
+  auto-collapsed chat panel)? (Still open: claude.ai login terms;
+  `CLAUDE_CONFIG_DIR`.)
 
 ### 2026-11-05 — SG — M3 MacBook Air (session 9)
 - Done: Phase 8, 3D office. Added `three` 0.186.1 (pinned exact; 0.187.0
