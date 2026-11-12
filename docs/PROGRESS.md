@@ -7,7 +7,7 @@ Newest entry on top. Updated at the end of each session (`prompts/session-end.md
   `task_cancelled`, config/docs gaps, live path-guard proof)
 - Machine last used: M3 MacBook Air (SG)
 - Blockers: none. `uv run pytest` → 247 passed; `npm test` → 22 passed;
-  `npm run build` → build complete.
+  `npm run build` → build complete. Phone over Tailscale works (2026-11-12).
 
 ## Log
 
@@ -69,10 +69,22 @@ Newest entry on top. Updated at the end of each session (`prompts/session-end.md
   the path guard is unproven (run 2 came after it). Tasks cancelled while
   queued don't count toward the daily cap. At ~1024 px wide the chat panel
   covers most of the office; scroll-zoom barely works while it is open.
-  Phone over Tailscale: still unverified (not run). The backend is running
-  in the background from Claude Code's restart, not in my terminal.
-- Next: phone check over the tailnet per `docs/RUNNING.md` (I run the
-  `tailscale serve` commands); then choose Phase 10 work (step 3 of the plan:
+  Phone over Tailscale: done after the log commit, see below.
+- Phone over Tailscale (after a3f1aeb): opening the Mac's `100.x` IP failed
+  ("site can't be reached") — expected, servers bind 127.0.0.1 only, and
+  there was no serve config. Claude Code (with my OK) stopped my `nuxt dev`
+  and its own backend, started the backend (`env -i`, `FRONTEND_ORIGIN=
+  https://isaacs-laptop.cod-tiyanki.ts.net`) and the built frontend
+  (`HOST=127.0.0.1`, `NUXT_PUBLIC_API_BASE=...:8443`); I ran both
+  `tailscale serve --bg` commands. Verified: `serve status` → 443 → :3000 and
+  8443 → :8000, both "tailnet only"; over the tailnet from the Mac,
+  frontend 200, `/health` ok (first request empty, retry ok), `/usage` with
+  the tailnet Origin ok; a Python `websockets` client got all 6 events of
+  `20261112-003249-authorized-test-of-the-sandbox` through `wss://...:8443`;
+  the app loads and works on my phone. Both servers run in the background
+  from that Claude Code session (they stop with it); serve config persists.
+  RUNNING.md updated (Verified section).
+- Next: choose Phase 10 work (step 3 of the plan:
   more agents, task history, Mac mini service, or Bash/web tools — the last
   needs my approval and its own sandbox design).
 - Open questions: should the office get more room at ~1024 px (narrower or

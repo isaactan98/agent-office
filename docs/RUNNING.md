@@ -86,7 +86,8 @@ Find the name with `tailscale status` (or the admin console → Machines). Below
    ```bash
    cd frontend && HOST=127.0.0.1 PORT=3000 NUXT_PUBLIC_API_BASE=https://$MAC:8443 node .output/server/index.mjs
    ```
-3. Expose both to the tailnet (documented here, not yet run in this project):
+3. Expose both to the tailnet (first run 2026-11-12; use the full path above if
+   `tailscale` is not on PATH):
    ```bash
    tailscale serve --bg --https=443 http://127.0.0.1:3000
    ```
@@ -111,10 +112,17 @@ config across reboots until it is turned off.
 - `tailscale funnel` — that makes it public on the internet.
 - Cloudflare Tunnel, port forwarding, or `--host 0.0.0.0`.
 
-### Unverified
-- The live feed uses a WebSocket (`wss://$MAC:8443/ws/tasks/...`). The Tailscale
-  serve docs do not say whether serve proxies WebSockets. If the feed shows
-  `error`, the rest of the UI (task list, files, usage) still works.
+### Verified (2026-11-12)
+- The steps above work from my phone (Tailscale app connected).
+- `tailscale serve` passes the live feed's WebSocket
+  (`wss://$MAC:8443/ws/tasks/...`) through: a client on the Mac received all
+  6 events of a finished task, ending in `task_done`.
+- The first HTTPS request right after `serve` may come back empty while the
+  certificate is issued; retry.
+- Opening the Mac's `100.x` Tailscale IP does not work (the servers listen on
+  `127.0.0.1` only). Use `https://$MAC`.
+- `--bg` keeps the serve config across reboots, but the two servers do not
+  restart by themselves: start them again (steps 1–2).
 
 ## Leaving it running
 - One task runs at a time. A task sent while another runs gets status `queued`
